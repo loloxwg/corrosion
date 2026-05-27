@@ -875,7 +875,7 @@ impl BookieDbParams {
             let len = self.complete_version_deletes.len();
             if count != len {
                 warn!("did not delete some complete versions from db, expected {len}, got {count}");
-                let details = json!({"count": count, "expected": len});
+                let details = json!({"count": count, "expected": len, version});
                 assert_unreachable!("ineffective deletion of complete versions in-db", &details);
             }
         }
