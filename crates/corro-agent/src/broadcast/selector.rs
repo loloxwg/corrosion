@@ -28,6 +28,7 @@ pub struct Candidate {
 const UNKNOWN_RING: f64 = 4.0; // 未知链路按中等偏差处理，给它被探测的机会
 const JITTER_WEIGHT: f64 = 0.25; // 探索抖动：避免总固定打同几个 peer
 const RELEVANCE_WEIGHT: f64 = 2.0; // 数据相关度：关心该数据的 peer 强加分(压过链路项)
+const COVERAGE_QUOTA: usize = 1; // 减量变体：除关心者外额外保留的覆盖名额(容断兜底/防孤立)
 
 /// 从候选 peer 中选出最多 k 个作为本次广播目标。
 ///
@@ -46,6 +47,9 @@ pub fn select_broadcast_targets(
         BroadcastStrategy::Scored => {
             scored_targets(candidates, tables, interest_routing, k, rng)
         }
+        BroadcastStrategy::ScoredReduce => {
+            scored_reduce_targets(candidates, tables, interest_routing, k, rng)
+        }
         BroadcastStrategy::Rl => {
             // TODO(research): 阶段3 GraphRL。暂复用打分式。
             trace!("broadcast strategy Rl 尚未实现，本次回退打分式");
@@ -59,6 +63,49 @@ fn random_targets(candidates: &[Candidate], k: usize, rng: &mut StdRng) -> Vec<S
     candidates.iter().map(|c| c.addr).choose_multiple(rng, k)
 }
 
+/// 这条 mutation 的"关心者"集合 = 涉及表的兴趣 addr 之并。
+fn interested_set(
+    tables: &[String],
+    interest_routing: &HashMap<String, Vec<SocketAddr>>,
+) -> HashSet<SocketAddr> {
+    tables
+        .iter()
+        .filter_map(|t| interest_routing.get(t))
+        .flatten()
+        .copied()
+        .collect()
+}
+
+/// 减量变体（对接 4.4.3）：先把候选池缩到「关心者 + 少量覆盖配额」，再在缩小的池子里打分取 Top-K。
+/// 任务无关平台被剔出快速推送 → 推送传输量随 |关心者|/|全量| 下降。
+/// 无 interest 路由信号时无从判断该砍谁，退化为打分式（不减量，保正确性与活性）。
+fn scored_reduce_targets(
+    candidates: &[Candidate],
+    tables: &[String],
+    interest_routing: &HashMap<String, Vec<SocketAddr>>,
+    k: usize,
+    rng: &mut StdRng,
+) -> Vec<SocketAddr> {
+    let interested = interested_set(tables, interest_routing);
+    if interested.is_empty() {
+        return scored_targets(candidates, tables, interest_routing, k, rng);
+    }
+    // 非关心者按链路质量(ring 升序，未知排最后)排序，取前 COVERAGE_QUOTA 个做容断兜底。
+    let mut others: Vec<Candidate> = candidates
+        .iter()
+        .filter(|c| !interested.contains(&c.addr))
+        .copied()
+        .collect();
+    others.sort_by_key(|c| c.ring.unwrap_or(u8::MAX));
+    let pool: Vec<Candidate> = candidates
+        .iter()
+        .filter(|c| interested.contains(&c.addr))
+        .copied()
+        .chain(others.into_iter().take(COVERAGE_QUOTA))
+        .collect();
+    scored_targets(&pool, tables, interest_routing, k, rng)
+}
+
 /// 打分式：链路质量 + 数据相关度 + 探索抖动，取 Top-K。
 fn scored_targets(
     candidates: &[Candidate],
@@ -67,13 +114,7 @@ fn scored_targets(
     k: usize,
     rng: &mut StdRng,
 ) -> Vec<SocketAddr> {
-    // 这条 mutation 的"关心者"集合 = 涉及表的兴趣 addr 之并。
-    let interested: HashSet<SocketAddr> = tables
-        .iter()
-        .filter_map(|t| interest_routing.get(t))
-        .flatten()
-        .copied()
-        .collect();
+    let interested = interested_set(tables, interest_routing);
 
     let mut scored: Vec<(f64, SocketAddr)> = candidates
         .iter()
@@ -158,6 +199,61 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(1);
         assert_eq!(scored_targets(&candidates, &[], &no_interest(), 3, &mut rng).len(), 3);
         assert_eq!(scored_targets(&candidates, &[], &no_interest(), 100, &mut rng).len(), 10);
+    }
+
+    #[test]
+    fn reduce_drops_uninterested_peers() {
+        // 1 个关心者 + 9 个无关 peer，k 很大。减量应只推给 关心者 + COVERAGE_QUOTA 个覆盖，
+        // 而非全量 10 个 —— 这才是降量。
+        let interested = cand(9000, Some(5));
+        let mut candidates = vec![interested];
+        for p in 9001..9010 {
+            candidates.push(cand(p, Some(1)));
+        }
+        let mut routing = HashMap::new();
+        routing.insert("flight".to_string(), vec![interested.addr]);
+        let mut rng = StdRng::seed_from_u64(3);
+        let picked = scored_reduce_targets(
+            &candidates,
+            &["flight".to_string()],
+            &routing,
+            100,
+            &mut rng,
+        );
+        assert_eq!(picked.len(), 1 + COVERAGE_QUOTA, "应只剩关心者+覆盖配额");
+        assert!(picked.contains(&interested.addr), "关心者必须在内");
+    }
+
+    #[test]
+    fn reduce_falls_back_to_scored_without_interest() {
+        // 无 interest 路由信号时不该乱砍：退化为打分式，k>=候选数则全选。
+        let candidates: Vec<_> = (9000..9005).map(|p| cand(p, Some(1))).collect();
+        let mut rng = StdRng::seed_from_u64(1);
+        let picked = scored_reduce_targets(&candidates, &[], &no_interest(), 100, &mut rng);
+        assert_eq!(picked.len(), 5, "无相关度信号应退化为不减量");
+    }
+
+    #[test]
+    fn reduce_coverage_prefers_best_link() {
+        // 覆盖名额应从非关心者里挑链路最好(ring 最小)的那个，做容断兜底。
+        let interested = cand(9000, Some(9));
+        let far = cand(9001, Some(9));
+        let near = cand(9002, Some(0)); // 非关心者中链路最好
+        let candidates = vec![interested, far, near];
+        let mut routing = HashMap::new();
+        routing.insert("flight".to_string(), vec![interested.addr]);
+        let mut rng = StdRng::seed_from_u64(11);
+        let picked = scored_reduce_targets(
+            &candidates,
+            &["flight".to_string()],
+            &routing,
+            100,
+            &mut rng,
+        );
+        assert_eq!(picked.len(), 2);
+        assert!(picked.contains(&interested.addr));
+        assert!(picked.contains(&near.addr), "覆盖名额应选链路最优的 near");
+        assert!(!picked.contains(&far.addr), "链路差的非关心者应被砍掉");
     }
 
     #[test]

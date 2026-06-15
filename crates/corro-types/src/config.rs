@@ -249,8 +249,11 @@ pub enum BroadcastStrategy {
     /// 现状基线：在候选 peer 中纯随机选 K 个。
     #[default]
     Random,
-    /// 阶段1：按价值打分选 Top-K（数据相关度/链路/角色/负载）。
+    /// 阶段1：按价值打分选 Top-K（数据相关度/链路/角色/负载）。重定向，不减量。
     Scored,
+    /// 阶段1a 减量变体：候选池只留「关心该 mutation 的 peer」+ 少量覆盖配额，
+    /// 任务无关平台不走快速推送 → 降全局推送量（对接 4.4.3）。无 interest 路由时退化为 Scored。
+    ScoredReduce,
     /// 阶段3：图强化学习决策。
     Rl,
 }
