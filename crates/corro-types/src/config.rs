@@ -232,6 +232,22 @@ pub struct GossipConfig {
     pub disable_gso: bool,
     #[serde(default)]
     pub member_id: Option<MemberId>,
+    /// 广播传播时如何选目标 peer。研究用：random=现状基线，scored/rl=主动推送（见 docs/research）。
+    #[serde(default)]
+    pub broadcast_strategy: BroadcastStrategy,
+}
+
+/// 广播传播的选 peer 策略。主动推送研究的总开关。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BroadcastStrategy {
+    /// 现状基线：在候选 peer 中纯随机选 K 个。
+    #[default]
+    Random,
+    /// 阶段1：按价值打分选 Top-K（数据相关度/链路/角色/负载）。
+    Scored,
+    /// 阶段3：图强化学习决策。
+    Rl,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -543,6 +559,7 @@ impl ConfigBuilder {
                 max_mtu: self.max_mtu,
                 disable_gso: self.disable_gso,
                 member_id: self.member_id,
+                broadcast_strategy: BroadcastStrategy::default(),
             },
             perf: self.perf.unwrap_or_default(),
             admin: AdminConfig {

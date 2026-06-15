@@ -20,7 +20,7 @@ use futures::{
 use governor::{Quota, RateLimiter};
 use metrics::{counter, gauge};
 use parking_lot::RwLock;
-use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
+use rand::{rngs::StdRng, SeedableRng};
 use rusqlite::params;
 use spawn::spawn_counted;
 use speedy::Writable;
@@ -42,6 +42,9 @@ use corro_types::{
     channel::{bounded, CorroReceiver, CorroSender},
     sqlite::unnest_param,
 };
+
+mod selector;
+use selector::select_broadcast_targets;
 
 use crate::{agent::util::log_at_pow_10, transport::Transport};
 
@@ -690,6 +693,9 @@ async fn handle_broadcasts(
                 }
             };
 
+            // 选 peer 策略（研究开关）：random=基线，scored/rl=主动推送。
+            let broadcast_strategy = agent.config().gossip.broadcast_strategy;
+
             debug!(
                 "choosing {} broadcasts, ring0 count: {}, MAX_INFLIGHT_BROADCAST: {}",
                 choose_count, ring0_count, MAX_INFLIGHT_BROADCAST
@@ -698,7 +704,9 @@ async fn handle_broadcasts(
                 let mut pending = to_broadcast.pop_front().unwrap();
 
                 let broadcast_to = {
-                    agent
+                    // 先筛出合法候选 peer（排除自己/异 cluster/ring0(本地广播时)/已发过的），
+                    // 再交给可替换的选择器决定发给谁——这是主动推送研究的接缝。
+                    let candidates: Vec<_> = agent
                         .members()
                         .read()
                         .states
@@ -719,14 +727,12 @@ async fn handle_broadcasts(
                                 Some(state.addr)
                             }
                         })
-                        .choose_multiple(
-                            &mut rng,
-                            // prevent going over max count
-                            cmp::min(
-                                choose_count,
-                                MAX_INFLIGHT_BROADCAST.saturating_sub(join_set.len()),
-                            ),
-                        )
+                        .collect();
+                    let k = cmp::min(
+                        choose_count,
+                        MAX_INFLIGHT_BROADCAST.saturating_sub(join_set.len()),
+                    );
+                    select_broadcast_targets(broadcast_strategy, &candidates, k, &mut rng)
                 };
 
                 let mut spawn_count = 0;

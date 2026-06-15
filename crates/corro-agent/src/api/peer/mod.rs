@@ -2421,6 +2421,7 @@ mod tests {
             max_mtu: None,
             disable_gso: false,
             member_id: None,
+            broadcast_strategy: Default::default(),
         };
 
         let server = gossip_server_endpoint(&gossip_config).await?;
