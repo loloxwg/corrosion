@@ -495,7 +495,8 @@ async fn handle_broadcasts(
     let max_queue_len = agent.config().perf.processing_queue_len;
     const MAX_INFLIGHT_BROADCAST: usize = 500;
     let mut to_broadcast = VecDeque::new();
-    let mut to_local_broadcast = VecDeque::new();
+    // (payload, tables)：tables 随 ring0 快速推送一起带出，供 selector 按 interest 减量。
+    let mut to_local_broadcast: VecDeque<(Bytes, Vec<String>)> = VecDeque::new();
     let mut log_count = 0;
 
     let mut limited_log_count = 0;
@@ -577,10 +578,11 @@ async fn handle_broadcasts(
 
                 // mission-aware：累加这条广播涉及的表，随对应缓冲一起带出。
                 let tables = changeset_tables(&bcast);
+                // 借用累加(iter().cloned())，保留 tables 所有权给下方 to_local_broadcast 带出。
                 if is_local {
-                    local_tables.extend(tables);
+                    local_tables.extend(tables.iter().cloned());
                 } else {
-                    bcast_tables.extend(tables);
+                    bcast_tables.extend(tables.iter().cloned());
                 }
 
                 if let Err(e) = (UniPayload::V1 {
@@ -608,7 +610,8 @@ async fn handle_broadcasts(
 
                     local_bcast_buf.extend_from_slice(&payload);
 
-                    to_local_broadcast.push_front(payload);
+                    // 带上本条广播涉及的表，供 ring0 flood 的 selector 做 interest 减量。
+                    to_local_broadcast.push_front((payload, tables));
 
                     if local_bcast_buf.len() >= broadcast_cutoff {
                         to_broadcast.push_front(PendingBroadcast::with_tables(
@@ -650,16 +653,53 @@ async fn handle_broadcasts(
         let prev_rate_limited = rate_limited;
         rate_limited = false;
 
+        // 选 peer 策略（研究开关）：random=基线全发，scored_reduce=按任务相关度减量，rl=占位。
+        // 兴趣路由一次性快照(clone 后立即释放配置 guard)，供 mission-aware 相关度打分。
+        // 两条推送路径(ring0 快速 flood + 远端 selector)共用，让评分函数统一管"目标平台"。
+        let (broadcast_strategy, interest_routing) = {
+            let cfg = agent.config();
+            (
+                cfg.gossip.broadcast_strategy,
+                cfg.gossip.interest_routing.clone(),
+            )
+        };
+
         // start with local broadcasts, they're higher priority
         let mut ring0 = HashSet::new();
         while !to_local_broadcast.is_empty() && join_set.len() < MAX_INFLIGHT_BROADCAST {
             // UNWRAP: we just checked that it wasn't empty
-            let payload = to_local_broadcast.pop_front().unwrap();
+            let (payload, tables) = to_local_broadcast.pop_front().unwrap();
 
-            let members = agent.members().read();
+            // ring0(RTT 最近一圈)候选 → 交给 selector 决定 flood 给谁：
+            // random 传 k=全部候选，等价原"全发 ring0";scored_reduce 只发关心该数据的 + 覆盖配额。
+            let ring0_addrs: Vec<SocketAddr> = {
+                let members = agent.members().read();
+                members.ring0(agent.cluster_id()).collect()
+            };
+            // 排除集 = 全部 ring0：无论是否被快速推送，都不再走远端 selector 路径，
+            // 任务无关近邻由 anti-entropy 兜底——这正是"不走快速推送"的减量来源。
+            for &addr in &ring0_addrs {
+                ring0.insert(addr);
+            }
+            let candidates: Vec<Candidate> = ring0_addrs
+                .iter()
+                .map(|&addr| Candidate {
+                    addr,
+                    ring: Some(0),
+                })
+                .collect();
+            let targets = select_broadcast_targets(
+                broadcast_strategy,
+                &candidates,
+                &tables,
+                &interest_routing,
+                candidates.len(),
+                &mut rng,
+            );
+
             let mut spawn_count = 0;
-            let mut ring0_count = 0;
-            for addr in members.ring0(agent.cluster_id()) {
+            let target_count = targets.len();
+            for addr in targets {
                 if join_set.len() >= MAX_INFLIGHT_BROADCAST {
                     debug!(
                         "breaking, max inflight broadcast reached: {}",
@@ -667,8 +707,6 @@ async fn handle_broadcasts(
                     );
                     break;
                 }
-                ring0_count += 1;
-                ring0.insert(addr);
 
                 match try_transmit_broadcast(
                     &bytes_per_sec,
@@ -697,17 +735,18 @@ async fn handle_broadcasts(
                         }
                     }
                     Ok(fut) => {
+                        // 发送字节埋点(同 global 路径)：降量按字节算。
+                        counter!("corro.broadcast.sent.bytes", "type" => "local")
+                            .increment(payload.len() as u64);
                         join_set.spawn(fut);
                         spawn_count += 1;
                     }
                 }
             }
 
-            // couldn't send it anywhere!
-            if rate_limited && spawn_count == 0 && ring0_count > 0 {
-                // push it back in front since this got nowhere and it's still the
-                // freshest item we have in the queue
-                to_local_broadcast.push_front(payload);
+            // couldn't send it anywhere (rate limited)! re-queue the freshest item.
+            if rate_limited && spawn_count == 0 && target_count > 0 {
+                to_local_broadcast.push_front((payload, tables));
                 break;
             }
 
@@ -735,16 +774,6 @@ async fn handle_broadcasts(
                 } else {
                     (count, max_transmissions)
                 }
-            };
-
-            // 选 peer 策略（研究开关）：random=基线，scored/rl=主动推送。
-            // 兴趣路由一次性快照(clone 后立即释放配置 guard)，供 mission-aware 相关度打分。
-            let (broadcast_strategy, interest_routing) = {
-                let cfg = agent.config();
-                (
-                    cfg.gossip.broadcast_strategy,
-                    cfg.gossip.interest_routing.clone(),
-                )
             };
 
             debug!(
@@ -827,6 +856,9 @@ async fn handle_broadcasts(
                         }
                         Ok(fut) => {
                             debug!(actor = %actor_id, "broadcasting {} bytes to: {addr}", pending.payload.len());
+                            // 发送字节埋点：30%降量(4.4.3)按字节算，spawn 只是次数代理。
+                            counter!("corro.broadcast.sent.bytes", "type" => "global")
+                                .increment(pending.payload.len() as u64);
                             join_set.spawn(fut);
                             pending.sent_to.insert(addr);
                             spawn_count += 1;
@@ -871,7 +903,7 @@ async fn handle_broadcasts(
 // Drop the oldest, most sent item or the oldest local item
 fn drop_oldest_broadcast(
     queue: &mut VecDeque<PendingBroadcast>,
-    local_queue: &mut VecDeque<Bytes>,
+    local_queue: &mut VecDeque<(Bytes, Vec<String>)>,
     max: usize,
 ) -> Option<PendingBroadcast> {
     if queue.len() + local_queue.len() > max {
@@ -883,7 +915,9 @@ fn drop_oldest_broadcast(
         return if let Some((i, _)) = max_sent {
             queue.remove(i)
         } else {
-            local_queue.pop_back().map(PendingBroadcast::new_local)
+            local_queue
+                .pop_back()
+                .map(|(payload, tables)| PendingBroadcast::with_tables(payload, true, tables))
         };
     }
 
