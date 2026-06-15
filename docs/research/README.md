@@ -11,7 +11,8 @@ crates/                       Corrosion 原代码（基线）
   corro-agent/src/broadcast/mod.rs   ★ 传播选 peer 的核心，研究改造点
 docs/research/
   README.md                   本文件
-  active-push-plan.md         主动推送改造方案 + 对照实验设计
+  active-push-plan.md         主动推送改造方案 + 对照实验设计（§8 = 1b 前提）
+  active-push-1b-design.md     1b 详细设计：对账按 interest 过滤（数据流/记账/协议）
   gossipdb-design.md          教学最小实现的设计文档（原理推导）
 sandbox/gossipdb/             自研 200 行教学原型（HLC/CRDT/SWIM/对账全透明）
                               用于吃透 Corrosion 每块在干嘛，非生产代码
