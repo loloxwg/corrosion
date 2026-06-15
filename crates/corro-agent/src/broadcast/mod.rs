@@ -44,7 +44,7 @@ use corro_types::{
 };
 
 mod selector;
-use selector::select_broadcast_targets;
+use selector::{select_broadcast_targets, Candidate};
 
 use crate::{agent::util::log_at_pow_10, transport::Transport};
 
@@ -724,7 +724,11 @@ async fn handle_broadcasts(
                             {
                                 None
                             } else {
-                                Some(state.addr)
+                                // 带上链路质量信号(ring)供打分式选择器使用
+                                Some(Candidate {
+                                    addr: state.addr,
+                                    ring: state.ring,
+                                })
                             }
                         })
                         .collect();
