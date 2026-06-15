@@ -38,13 +38,34 @@ use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
 use corro_types::{
     actor::{Actor, ActorId},
     agent::Agent,
-    broadcast::{BroadcastInput, DispatchRuntime, FocaCmd, FocaInput, UniPayload, UniPayloadV1},
+    broadcast::{
+        BroadcastInput, BroadcastV1, Changeset, DispatchRuntime, FocaCmd, FocaInput, UniPayload,
+        UniPayloadV1,
+    },
     channel::{bounded, CorroReceiver, CorroSender},
     sqlite::unnest_param,
 };
 
 mod selector;
 use selector::{select_broadcast_targets, Candidate};
+
+/// 提取一条广播涉及的表名（用于 mission-aware 相关度打分）。
+fn changeset_tables(bcast: &BroadcastV1) -> Vec<String> {
+    let BroadcastV1::Change(change) = bcast;
+    match &change.changeset {
+        Changeset::Full { changes, .. } => changes.iter().map(|c| c.table.to_string()).collect(),
+        Changeset::FullV2 { changes, .. } => changes.count().into_keys().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// 取出累加的表名并去重清空（缓冲 split 成一个 PendingBroadcast 时调用）。
+fn take_tables(acc: &mut Vec<String>) -> Vec<String> {
+    let mut t = std::mem::take(acc);
+    t.sort();
+    t.dedup();
+    t
+}
 
 use crate::{agent::util::log_at_pow_10, transport::Transport};
 
@@ -446,6 +467,9 @@ async fn handle_broadcasts(
     let mut bcast_buf = BytesMut::new();
     let mut local_bcast_buf = BytesMut::new();
     let mut single_bcast_buf = BytesMut::new();
+    // mission-aware：与两个缓冲区平行累加各自涉及的表名，split 时随 PendingBroadcast 带出。
+    let mut bcast_tables: Vec<String> = Vec::new();
+    let mut local_tables: Vec<String> = Vec::new();
 
     let mut metrics_interval = interval(Duration::from_secs(10));
 
@@ -528,11 +552,17 @@ async fn handle_broadcasts(
             }
             Branch::BroadcastDeadline => {
                 if !bcast_buf.is_empty() {
-                    to_broadcast.push_front(PendingBroadcast::new(bcast_buf.split().freeze()));
+                    to_broadcast.push_front(PendingBroadcast::with_tables(
+                        bcast_buf.split().freeze(),
+                        false,
+                        take_tables(&mut bcast_tables),
+                    ));
                 }
                 if !local_bcast_buf.is_empty() {
-                    to_broadcast.push_front(PendingBroadcast::new_local(
+                    to_broadcast.push_front(PendingBroadcast::with_tables(
                         local_bcast_buf.split().freeze(),
+                        true,
+                        take_tables(&mut local_tables),
                     ));
                 }
             }
@@ -544,6 +574,14 @@ async fn handle_broadcasts(
                     BroadcastInput::AddBroadcast(bcast) => (bcast, true),
                 };
                 trace!("adding broadcast: {bcast:?}, local? {is_local}");
+
+                // mission-aware：累加这条广播涉及的表，随对应缓冲一起带出。
+                let tables = changeset_tables(&bcast);
+                if is_local {
+                    local_tables.extend(tables);
+                } else {
+                    bcast_tables.extend(tables);
+                }
 
                 if let Err(e) = (UniPayload::V1 {
                     data: UniPayloadV1::Broadcast(bcast.clone()),
@@ -573,8 +611,10 @@ async fn handle_broadcasts(
                     to_local_broadcast.push_front(payload);
 
                     if local_bcast_buf.len() >= broadcast_cutoff {
-                        to_broadcast.push_front(PendingBroadcast::new_local(
+                        to_broadcast.push_front(PendingBroadcast::with_tables(
                             local_bcast_buf.split().freeze(),
+                            true,
+                            take_tables(&mut local_tables),
                         ));
                     }
                 } else {
@@ -585,7 +625,11 @@ async fn handle_broadcasts(
                     }
 
                     if bcast_buf.len() >= broadcast_cutoff {
-                        to_broadcast.push_front(PendingBroadcast::new(bcast_buf.split().freeze()));
+                        to_broadcast.push_front(PendingBroadcast::with_tables(
+                            bcast_buf.split().freeze(),
+                            false,
+                            take_tables(&mut bcast_tables),
+                        ));
                     }
                 }
             }
@@ -694,7 +738,14 @@ async fn handle_broadcasts(
             };
 
             // 选 peer 策略（研究开关）：random=基线，scored/rl=主动推送。
-            let broadcast_strategy = agent.config().gossip.broadcast_strategy;
+            // 兴趣路由一次性快照(clone 后立即释放配置 guard)，供 mission-aware 相关度打分。
+            let (broadcast_strategy, interest_routing) = {
+                let cfg = agent.config();
+                (
+                    cfg.gossip.broadcast_strategy,
+                    cfg.gossip.interest_routing.clone(),
+                )
+            };
 
             debug!(
                 "choosing {} broadcasts, ring0 count: {}, MAX_INFLIGHT_BROADCAST: {}",
@@ -736,7 +787,14 @@ async fn handle_broadcasts(
                         choose_count,
                         MAX_INFLIGHT_BROADCAST.saturating_sub(join_set.len()),
                     );
-                    select_broadcast_targets(broadcast_strategy, &candidates, k, &mut rng)
+                    select_broadcast_targets(
+                        broadcast_strategy,
+                        &candidates,
+                        &pending.tables,
+                        &interest_routing,
+                        k,
+                        &mut rng,
+                    )
                 };
 
                 let mut spawn_count = 0;
@@ -1050,24 +1108,26 @@ struct PendingBroadcast {
     is_local: bool,
     sent_to: HashSet<SocketAddr>,
     send_count: u8,
+    // 本次广播涉及的表(用于 mission-aware 相关度打分)。空=未知/不参与相关度。
+    tables: Vec<String>,
 }
 
 impl PendingBroadcast {
     pub fn new(payload: Bytes) -> Self {
-        Self {
-            payload,
-            is_local: false,
-            sent_to: Default::default(),
-            send_count: 0,
-        }
+        Self::with_tables(payload, false, Vec::new())
     }
 
     pub fn new_local(payload: Bytes) -> Self {
+        Self::with_tables(payload, true, Vec::new())
+    }
+
+    pub fn with_tables(payload: Bytes, is_local: bool, tables: Vec<String>) -> Self {
         Self {
             payload,
-            is_local: true,
+            is_local,
             sent_to: Default::default(),
             send_count: 0,
+            tables,
         }
     }
 }
@@ -1183,6 +1243,7 @@ mod tests {
             is_local: false,
             send_count,
             sent_to: HashSet::new(),
+            tables: Vec::new(),
         }
     }
 

@@ -235,6 +235,11 @@ pub struct GossipConfig {
     /// 广播传播时如何选目标 peer。研究用：random=现状基线，scored/rl=主动推送（见 docs/research）。
     #[serde(default)]
     pub broadcast_strategy: BroadcastStrategy,
+    /// mission-aware 兴趣路由：表名 -> 关心该表的 peer gossip 地址列表。
+    /// scored 策略据此给"关心这条 mutation 的 peer"加分（数据相关度）。
+    /// 研究简化：兴趣由实验静态配置；动态 gossip 兴趣 profile 为后续工作。空=不启用。
+    #[serde(default)]
+    pub interest_routing: std::collections::HashMap<String, Vec<SocketAddr>>,
 }
 
 /// 广播传播的选 peer 策略。主动推送研究的总开关。
@@ -560,6 +565,7 @@ impl ConfigBuilder {
                 disable_gso: self.disable_gso,
                 member_id: self.member_id,
                 broadcast_strategy: BroadcastStrategy::default(),
+                interest_routing: Default::default(),
             },
             perf: self.perf.unwrap_or_default(),
             admin: AdminConfig {
