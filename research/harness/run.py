@@ -60,6 +60,16 @@ def build_routing(n, base_gossip):
     return routing
 
 
+def write_interest(nodes):
+    """各节点自声明 interest：写入复制表 node_interest(本节点 crsql_site_id(), 关心的表)。
+    经正常 exec 写入→走 crsqlite 复制路径→全集群可见；推送端聚合它选目标平台。"""
+    for nd in nodes:
+        for t in ROLE_TABLES[nd["role"]]:
+            sh([BIN, "-c", nd["cfg"], "exec",
+                "INSERT INTO node_interest (actor_id, table_name) "
+                f"VALUES (crsql_site_id(), '{t}')"])
+
+
 def write_configs(n, base_gossip, base_api, base_prom, strategy):
     """生成 n 个节点配置；节点 0 为种子，其余 bootstrap 到它。"""
     schema_dir = os.path.join(WORK, "schema")
@@ -68,13 +78,11 @@ def write_configs(n, base_gossip, base_api, base_prom, strategy):
         for t in TABLES:
             f.write(f"CREATE TABLE {t} (id BLOB NOT NULL PRIMARY KEY, "
                     f"data TEXT NOT NULL DEFAULT '');\n")
-
-    routing = build_routing(n, base_gossip)
-    # interest_routing 各节点一致（全局路由表）；TOML 子表形式。
-    routing_toml = "[gossip.interest_routing]\n" + "".join(
-        f'{t} = [{", ".join(chr(34) + a + chr(34) for a in addrs)}]\n'
-        for t, addrs in routing.items()
-    )
+        # node_interest：每节点自声明 interest 的复制表(CRR)。
+        # actor_id=本节点 crsql_site_id()，table_name=关心的表；推送端聚合它选目标。
+        f.write("CREATE TABLE node_interest (actor_id BLOB NOT NULL, "
+                "table_name TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, "
+                "PRIMARY KEY (actor_id, table_name));\n")
 
     nodes = []
     for i in range(n):
@@ -97,7 +105,7 @@ addr = "127.0.0.1:{api}"
 path = "{WORK}/node{i}-admin.sock"
 [telemetry]
 prometheus.addr = "127.0.0.1:{prom}"
-{routing_toml}""")
+""")
         nodes.append({"i": i, "role": role_of(i), "cfg": cfg,
                       "api": api, "prom": prom,
                       "log": os.path.join(WORK, f"node{i}.log")})
@@ -185,7 +193,9 @@ def run_once(n, rows, strategy):
         if not wait_active(nodes):
             print(f"  [{strategy}] 节点未全部 ACTIVE，跳过")
             return None
-        time.sleep(2)
+        write_interest(nodes)
+        # 等 interest 复制到全集群 + 推送端 3s 缓存刷新采纳（在 before 快照之前，不计入度量）
+        time.sleep(6)
         before = {nd["i"]: scrape(nd, METRICS) for nd in nodes}
 
         prefix = f"r{int(time.time())}_"
