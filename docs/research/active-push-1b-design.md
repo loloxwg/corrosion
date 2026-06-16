@@ -146,6 +146,34 @@ SELECT EXISTS(
 - **兼容**：新旧节点混合集群收敛正常(`interest=None` == 全量)。
 - interest 表对账后本地可见；非 interest 表本地缺失但查询路由可达。
 
+## 7.5 Phase 2 实测结论与 Phase 3 的必要性（关键发现）
+
+`verify_phase2.py`(9 节点, scored_reduce)实测：
+
+- ✅ **B3 通过**：所有节点 `__corro_bookkeeping_gaps`、`corro.sync.client.needed.v2` 不增长
+  (0→0)，无死锁、无无限重请求。**Phase 2 的高风险核心(关 gap)是安全的。**
+- ✅ **sync 过滤生效**：interest 过滤计数器 filtered>0；scored_reduce 对账字节显著低于 random。
+- ❌ **但非关心数据仍遍布全网**：非写入节点上「非关心表」行数 ≈ 满，不是 0。诊断：
+  filtered=2 / kept=12 —— 过滤触发了，但 sync 几乎没机会过滤，因为**数据早被 push 送达**。
+
+**根因**：corrosion 是 eager-push + epidemic 模型，**收到任何变更即 apply 并 rebroadcast**，
+无接收端过滤。Phase 1 只减 push 扇出、Phase 2 只过滤 sync——只要有一条 push 泄漏
+(coverage 配额 / 多跳 rebroadcast)，非关心数据就被应用并继续扩散，最终全网都有。
+**sender 侧减量(1a+1b)能降「传输冗余」，但不能实现「部分副本(placement)」。**
+
+### Phase 3（接收端过滤）——实现 placement 的关键，但有正确性难点
+
+思路：节点 apply 收到的版本时，若该版本不碰本节点任一 interest 表 → **丢弃不存** +
+**不 rebroadcast**(掐断非关心数据的 epidemic) + 记账为「已知」(不再 re-sync)。
+
+⚠ **正确性难点(必须先解决)**：节点丢弃版本 V 后若 heads 仍前进、对外宣称「有 V」，
+则关心 V 的 peer M 向它对账时，它 `handle_need` 查不到 V 的数据 → 发 `Changeset::Empty` →
+**M 误以为 V 已满足、永远拿不到真数据**。必须区分「版本空(compacted)」与「我丢弃了/不持有」：
+丢弃的版本**不能**对关心者回 Empty，要么不进 heads、要么回「我没有，问别人」让 M 保持 gap
+向真正持有者(同 interest 的节点)拉。只要同 interest 节点构成连通子图，M 总能从同伴拿到 V。
+
+→ Phase 3 是 placement 与「稳定降量」的钥匙，但牵涉 heads/数据可用性，需单独设计+对抗复核。
+
 ## 8. 风险与开放问题
 
 - **每版本 EXISTS 查询的开销**：版本级判定每版本查一次 `crsql_changes`。若成热点，再建
