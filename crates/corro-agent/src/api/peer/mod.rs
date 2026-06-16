@@ -13,7 +13,7 @@ use corro_types::broadcast::{
     BiPayload, BiPayloadV1, ChangeSource, ChangeV1, Changeset, Timestamp,
 };
 use corro_types::change::{row_to_change, Change, ChunkedChanges};
-use corro_types::config::GossipConfig;
+use corro_types::config::{BroadcastStrategy, GossipConfig};
 use corro_types::sync::{
     generate_sync, SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncNeedV1, SyncRejectionV1,
     SyncRequestV1, SyncStateV1, SyncTraceContextV1,
@@ -375,11 +375,39 @@ const MIN_CHANGES_BYTES_PER_MESSAGE: usize = 1024;
 const ADAPT_CHUNK_SIZE_THRESHOLD: Duration = Duration::from_millis(500);
 
 #[allow(clippy::too_many_arguments)]
+/// 本节点对账时声明的 interest(关心的表)。
+/// 仅「智能模型」(scored/scored_reduce/rl)按 interest 过滤对账；
+/// `random`=广播式基线=全量复制(None)，保证 4.4.3 的 A/B 对照公平。
+/// interest 配置为空时也按全量(None)。
+fn interest_for_sync(agent: &Agent) -> Option<Vec<String>> {
+    let cfg = agent.config();
+    if matches!(cfg.gossip.broadcast_strategy, BroadcastStrategy::Random) {
+        return None;
+    }
+    let interest = cfg.gossip.interest.clone();
+    if interest.is_empty() {
+        None
+    } else {
+        Some(interest)
+    }
+}
+
+/// 把发起方 interest(Vec<String>) 转成查表用的 HashSet，并恒加入系统复制表 `node_interest`
+/// (否则节点间 interest 自身传不开，Phase 1 失效)。None → None（不过滤，全量）。
+fn interest_set(interest: &Option<Vec<String>>) -> Option<std::collections::HashSet<String>> {
+    interest.as_ref().map(|tables| {
+        let mut set: std::collections::HashSet<String> = tables.iter().cloned().collect();
+        set.insert("node_interest".to_string());
+        set
+    })
+}
+
 fn handle_need(
     conn: &mut Connection,
     actor_id: ActorId,
     need: SyncNeedV1,
     sender: &Sender<SyncMessage>,
+    interest: &Option<std::collections::HashSet<String>>,
 ) -> eyre::Result<()> {
     debug!(%actor_id, "handle known versions! need: {need:?}");
 
@@ -428,6 +456,29 @@ fn handle_need(
                 let last_seq: CrsqlSeq = row.get(1)?;
                 let ts: Timestamp = row.get(2)?;
                 debug!(%actor_id, ?version, %ts, "not empty");
+
+                // interest 版本级过滤(1b)：版本不碰任一关心表 → 当作空版本，计入 empties
+                // 走既有 Changeset::Empty 路径关 gap，跳过整版发送(降量)。node_interest 恒在集合内。
+                if let Some(interest_set) = interest {
+                    let mut tbl_stmt = tx.prepare_cached(
+                        r#"SELECT DISTINCT "table" FROM crsql_changes
+                            WHERE site_id = :actor_id AND db_version = :version"#,
+                    )?;
+                    let touches = tbl_stmt
+                        .query_map(
+                            named_params! { ":actor_id": actor_id, ":version": version },
+                            |r| r.get::<_, String>(0),
+                        )?
+                        .filter_map(Result::ok)
+                        .any(|t| interest_set.contains(&t));
+                    if !touches {
+                        counter!("corro.sync.interest.filtered.versions").increment(1);
+                        empties.insert(version..=version);
+                        continue;
+                    } else {
+                        counter!("corro.sync.interest.kept.versions").increment(1);
+                    }
+                }
 
                 let mut prepped = tx.prepare_cached(
                     r#"
@@ -813,6 +864,7 @@ async fn process_sync(
     bookie: Bookie,
     sender: Sender<SyncMessage>,
     recv: mpsc::Receiver<SyncRequestV1>,
+    interest: Option<std::collections::HashSet<String>>,
 ) -> eyre::Result<()> {
     let chunked_reqs = ReceiverStream::new(recv).chunks_timeout(10, Duration::from_millis(500));
     tokio::pin!(chunked_reqs);
@@ -889,11 +941,14 @@ async fn process_sync(
 
                         let pool = pool.clone();
                         let sender = sender.clone();
+                        let interest = interest.clone();
 
                         let fut = Box::pin(async move {
                             let mut conn = pool.read().await?;
 
-                            block_in_place(|| handle_need(&mut conn, actor_id, need, &sender))?;
+                            block_in_place(|| {
+                                handle_need(&mut conn, actor_id, need, &sender, &interest)
+                            })?;
 
                             Ok(())
                         });
@@ -1044,7 +1099,7 @@ pub async fn parallel_sync(
                         &mut codec,
                         &mut encode_buf,
                         &mut send_buf,
-                        BiPayload::V1 {data: BiPayloadV1::SyncStart {actor_id: agent.actor_id(), trace_ctx}, cluster_id: agent.cluster_id()},
+                        BiPayload::V1 {data: BiPayloadV1::SyncStart {actor_id: agent.actor_id(), trace_ctx, interest: interest_for_sync(agent)}, cluster_id: agent.cluster_id()},
                         &mut tx,
                     ).instrument(info_span!("write_sync_start"))
                     .await?;
@@ -1419,6 +1474,7 @@ pub async fn serve_sync(
     their_actor_id: ActorId,
     trace_ctx: SyncTraceContextV1,
     cluster_id: ClusterId,
+    their_interest: Option<Vec<String>>,
     mut read: FramedRead<RecvStream, LengthDelimitedCodec>,
     mut write: SendStream,
 ) -> Result<usize, SyncError> {
@@ -1527,8 +1583,10 @@ pub async fn serve_sync(
     let (tx_need, rx_need) = mpsc::channel(1024);
     let (tx, mut rx) = mpsc::channel::<SyncMessage>(256);
 
+    // 发起方(拉取方)声明的 interest → 版本级过滤的依据。None=全量(上游行为)。
+    let their_interest = interest_set(&their_interest);
     tokio::spawn(
-        process_sync(agent.pool().clone(), bookie.clone(), tx, rx_need)
+        process_sync(agent.pool().clone(), bookie.clone(), tx, rx_need, their_interest)
             .instrument(info_span!("process_sync"))
             .inspect_err(|e| error!("could not process sync request: {e}")),
     );
@@ -1869,6 +1927,7 @@ mod tests {
                         versions: dbvr!(1, 1),
                     },
                     &tx,
+                    &None,
                 )
             })?;
 
@@ -1900,6 +1959,7 @@ mod tests {
                         seqs: vec![dbsr!(0, 0)],
                     },
                     &tx,
+                    &None,
                 )
             })?;
 
@@ -1981,6 +2041,7 @@ mod tests {
                         seqs: vec![dbsr!(0, 0)],
                     },
                     &tx,
+                    &None,
                 )
             })?;
 
@@ -2011,6 +2072,7 @@ mod tests {
                         versions: dbvr!(1, 6),
                     },
                     &tx,
+                    &None,
                 )
             })?;
 
@@ -2180,6 +2242,7 @@ mod tests {
                         versions: dbvr!(1, 1000),
                     },
                     &tx,
+                    &None,
                 )
             })?;
 
@@ -2261,6 +2324,7 @@ mod tests {
                         seqs: vec![dbsr!(4, 7)],
                     },
                     &tx,
+                    &None,
                 )
             })?;
 
@@ -2302,6 +2366,7 @@ mod tests {
                         seqs: vec![dbsr!(2, 2), dbsr!(15, 24)],
                     },
                     &tx,
+                    &None,
                 )
             })?;
 

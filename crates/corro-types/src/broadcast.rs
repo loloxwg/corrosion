@@ -65,6 +65,11 @@ pub enum BiPayloadV1 {
         actor_id: ActorId,
         #[speedy(default_on_eof)]
         trace_ctx: SyncTraceContextV1,
+        /// 发起方(拉取方)自声明的 interest：它只关心这些表的数据。
+        /// 响应方 handle_need 据此版本级过滤(碰到的版本整版发，否则发 Changeset::Empty)。
+        /// None = 全量(旧节点/关闭态，向后兼容)。详见 docs/research/active-push-1b-design.md。
+        #[speedy(default_on_eof)]
+        interest: Option<Vec<String>>,
     },
 }
 

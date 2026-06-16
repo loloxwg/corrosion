@@ -88,6 +88,8 @@ def write_configs(n, base_gossip, base_api, base_prom, strategy):
     for i in range(n):
         gossip, api, prom = base_gossip + i, base_api + i, base_prom + i
         boot = "" if i == 0 else f'"[::1]:{base_gossip}"'
+        # 本节点自声明 interest(对应任务角色)：用于对账握手按表过滤(Phase 2)。
+        interest = ", ".join(f'"{t}"' for t in ROLE_TABLES[role_of(i)])
         cfg = os.path.join(WORK, f"node{i}.toml")
         with open(cfg, "w") as f:
             f.write(f"""[db]
@@ -99,6 +101,7 @@ external_addr = "[::1]:{gossip}"
 bootstrap = [{boot}]
 plaintext = true
 broadcast_strategy = "{strategy}"
+interest = [{interest}]
 [api]
 addr = "127.0.0.1:{api}"
 [admin]
