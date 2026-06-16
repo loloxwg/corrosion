@@ -72,36 +72,37 @@ fn take_tables(acc: &mut Vec<String>) -> Vec<String> {
 /// 推送端据此选目标平台。actor_id 经内存 members 解析成 gossip 地址。
 /// 表不存在 / 无数据 → 返回空 map，调用方回退到静态 `interest_routing` 配置。
 async fn load_interest_routing(agent: &Agent) -> HashMap<String, Vec<SocketAddr>> {
-    let mut map: HashMap<String, Vec<SocketAddr>> = HashMap::new();
     let conn = match agent.pool().read().await {
         Ok(c) => c,
         Err(e) => {
             warn!("interest 刷新：取读连接失败：{e}");
-            return map;
+            return HashMap::new();
         }
     };
-    let pairs: Vec<(ActorId, String)> = {
-        let mut stmt = match conn.prepare_cached("SELECT actor_id, table_name FROM node_interest") {
-            Ok(s) => s,
-            // 表未定义(未启用 node_interest) → 无信号，回退静态配置
-            Err(_) => return map,
-        };
-        let collected = match stmt.query_map([], |row| {
+    // SQLite 查询 + members 解析是同步阻塞，放进 block_in_place 别阻塞 tokio 运行时
+    // (与 handle_need 的 SQLite 读处理一致)。
+    tokio::task::block_in_place(|| {
+        let mut map: HashMap<String, Vec<SocketAddr>> = HashMap::new();
+        let mut stmt =
+            match conn.prepare_cached("SELECT actor_id, table_name FROM node_interest") {
+                Ok(s) => s,
+                // 表未定义(未启用 node_interest) → 无信号，回退静态配置
+                Err(_) => return map,
+            };
+        let pairs: Vec<(ActorId, String)> = match stmt.query_map([], |row| {
             Ok((row.get::<_, ActorId>(0)?, row.get::<_, String>(1)?))
         }) {
             Ok(rows) => rows.filter_map(Result::ok).collect(),
             Err(_) => return map,
         };
-        collected
-    };
-    drop(conn);
-    let members = agent.members().read();
-    for (actor_id, table) in pairs {
-        if let Some(state) = members.states.get(&actor_id) {
-            map.entry(table).or_default().push(state.addr);
+        let members = agent.members().read();
+        for (actor_id, table) in pairs {
+            if let Some(state) = members.states.get(&actor_id) {
+                map.entry(table).or_default().push(state.addr);
+            }
         }
-    }
-    map
+        map
+    })
 }
 
 use crate::{agent::util::log_at_pow_10, transport::Transport};
@@ -549,7 +550,7 @@ async fn handle_broadcasts(
     let mut rate_limited = false;
 
     // 推送端 interest 缓存：表 -> 关心它的 peer 地址。来源 node_interest 复制表，
-    // metrics tick(10s)周期刷新；为空时回退到静态 interest_routing 配置(兼容/关闭态)。
+    // InterestRefresh tick(3s)周期刷新；为空时回退到静态 interest_routing 配置(兼容/关闭态)。
     let mut interest_routing = load_interest_routing(&agent).await;
     if interest_routing.is_empty() {
         interest_routing = agent.config().gossip.interest_routing.clone();
@@ -713,7 +714,7 @@ async fn handle_broadcasts(
         rate_limited = false;
 
         // 选 peer 策略（研究开关）：random=基线全发，scored_reduce=按任务相关度减量，rl=占位。
-        // interest_routing 用循环缓存(node_interest 复制表，metrics tick 刷新)，两条推送路径共用。
+        // interest_routing 用循环缓存(node_interest 复制表，InterestRefresh tick 刷新)，两条推送路径共用。
         let broadcast_strategy = agent.config().gossip.broadcast_strategy;
 
         // start with local broadcasts, they're higher priority
