@@ -238,8 +238,14 @@ pub struct GossipConfig {
     /// mission-aware 兴趣路由：表名 -> 关心该表的 peer gossip 地址列表。
     /// scored 策略据此给"关心这条 mutation 的 peer"加分（数据相关度）。
     /// 研究简化：兴趣由实验静态配置；动态 gossip 兴趣 profile 为后续工作。空=不启用。
+    /// 注：被 `interest`(每节点自声明) + 复制表 `node_interest` 取代中；暂留作回退。
     #[serde(default)]
     pub interest_routing: std::collections::HashMap<String, Vec<SocketAddr>>,
+    /// 本节点自声明的 interest：它关心哪些表。对应 4.2.3「数据需求模版」的节点自描述。
+    /// 启动时写入复制表 `node_interest`，由全集群推送端/对账端读取。
+    /// 空 = 关心全部表（= corrosion 现状全量复制行为，opt-in 关闭态）。
+    #[serde(default)]
+    pub interest: Vec<String>,
 }
 
 /// 广播传播的选 peer 策略。主动推送研究的总开关。
@@ -569,6 +575,7 @@ impl ConfigBuilder {
                 member_id: self.member_id,
                 broadcast_strategy: BroadcastStrategy::default(),
                 interest_routing: Default::default(),
+                interest: Default::default(),
             },
             perf: self.perf.unwrap_or_default(),
             admin: AdminConfig {

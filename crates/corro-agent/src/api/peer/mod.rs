@@ -2423,6 +2423,7 @@ mod tests {
             member_id: None,
             broadcast_strategy: Default::default(),
             interest_routing: Default::default(),
+            interest: Default::default(),
         };
 
         let server = gossip_server_endpoint(&gossip_config).await?;

@@ -67,6 +67,43 @@ fn take_tables(acc: &mut Vec<String>) -> Vec<String> {
     t
 }
 
+/// 从复制表 `node_interest`(actor_id, table_name) 聚合出「表 -> 关心它的 peer 地址」。
+/// 每节点自声明 interest(对应 4.2.3 数据需求模版)经 crsqlite 复制到全集群，
+/// 推送端据此选目标平台。actor_id 经内存 members 解析成 gossip 地址。
+/// 表不存在 / 无数据 → 返回空 map，调用方回退到静态 `interest_routing` 配置。
+async fn load_interest_routing(agent: &Agent) -> HashMap<String, Vec<SocketAddr>> {
+    let mut map: HashMap<String, Vec<SocketAddr>> = HashMap::new();
+    let conn = match agent.pool().read().await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("interest 刷新：取读连接失败：{e}");
+            return map;
+        }
+    };
+    let pairs: Vec<(ActorId, String)> = {
+        let mut stmt = match conn.prepare_cached("SELECT actor_id, table_name FROM node_interest") {
+            Ok(s) => s,
+            // 表未定义(未启用 node_interest) → 无信号，回退静态配置
+            Err(_) => return map,
+        };
+        let collected = match stmt.query_map([], |row| {
+            Ok((row.get::<_, ActorId>(0)?, row.get::<_, String>(1)?))
+        }) {
+            Ok(rows) => rows.filter_map(Result::ok).collect(),
+            Err(_) => return map,
+        };
+        collected
+    };
+    drop(conn);
+    let members = agent.members().read();
+    for (actor_id, table) in pairs {
+        if let Some(state) = members.states.get(&actor_id) {
+            map.entry(table).or_default().push(state.addr);
+        }
+    }
+    map
+}
+
 use crate::{agent::util::log_at_pow_10, transport::Transport};
 
 #[derive(Clone)]
@@ -479,6 +516,8 @@ async fn handle_broadcasts(
         FuturesUnordered::<Pin<Box<dyn Future<Output = PendingBroadcast> + Send + 'static>>>::new();
 
     let mut bcast_interval = interval(opts.interval);
+    // interest 缓存刷新间隔(比 metrics 短，让自声明 interest 较快被推送端采纳)。
+    let mut interest_interval = interval(Duration::from_secs(3));
 
     enum Branch {
         Broadcast(BroadcastInput),
@@ -486,6 +525,7 @@ async fn handle_broadcasts(
         WokePendingBroadcast(PendingBroadcast),
         Tripped,
         Metrics,
+        InterestRefresh,
     }
 
     let mut tripped = false;
@@ -507,6 +547,13 @@ async fn handle_broadcasts(
     .with_middleware();
 
     let mut rate_limited = false;
+
+    // 推送端 interest 缓存：表 -> 关心它的 peer 地址。来源 node_interest 复制表，
+    // metrics tick(10s)周期刷新；为空时回退到静态 interest_routing 配置(兼容/关闭态)。
+    let mut interest_routing = load_interest_routing(&agent).await;
+    if interest_routing.is_empty() {
+        interest_routing = agent.config().gossip.interest_routing.clone();
+    }
 
     loop {
         let branch = tokio::select! {
@@ -542,6 +589,9 @@ async fn handle_broadcasts(
             },
             _ = metrics_interval.tick() => {
                 Branch::Metrics
+            },
+            _ = interest_interval.tick() => {
+                Branch::InterestRefresh
             }
         };
 
@@ -648,21 +698,23 @@ async fn handle_broadcasts(
                 gauge!("corro.broadcast.serialization.buffer.capacity")
                     .set(ser_buf.capacity() as f64);
             }
+            Branch::InterestRefresh => {
+                // 周期刷新 interest 缓存(node_interest 复制表 + 成员变化)。空则回退静态配置。
+                let refreshed = load_interest_routing(&agent).await;
+                interest_routing = if refreshed.is_empty() {
+                    agent.config().gossip.interest_routing.clone()
+                } else {
+                    refreshed
+                };
+            }
         }
 
         let prev_rate_limited = rate_limited;
         rate_limited = false;
 
         // 选 peer 策略（研究开关）：random=基线全发，scored_reduce=按任务相关度减量，rl=占位。
-        // 兴趣路由一次性快照(clone 后立即释放配置 guard)，供 mission-aware 相关度打分。
-        // 两条推送路径(ring0 快速 flood + 远端 selector)共用，让评分函数统一管"目标平台"。
-        let (broadcast_strategy, interest_routing) = {
-            let cfg = agent.config();
-            (
-                cfg.gossip.broadcast_strategy,
-                cfg.gossip.interest_routing.clone(),
-            )
-        };
+        // interest_routing 用循环缓存(node_interest 复制表，metrics tick 刷新)，两条推送路径共用。
+        let broadcast_strategy = agent.config().gossip.broadcast_strategy;
 
         // start with local broadcasts, they're higher priority
         let mut ring0 = HashSet::new();
