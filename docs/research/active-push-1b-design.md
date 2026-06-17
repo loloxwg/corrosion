@@ -146,33 +146,50 @@ SELECT EXISTS(
 - **兼容**：新旧节点混合集群收敛正常(`interest=None` == 全量)。
 - interest 表对账后本地可见；非 interest 表本地缺失但查询路由可达。
 
-## 7.5 Phase 2 实测结论与 Phase 3 的必要性（关键发现）
+## 7.5 实测复盘：根因 = payload 混表，正解 = 源端 payload 裁剪（重大修订）
 
-`verify_phase2.py`(9 节点, scored_reduce)实测：
+`verify_phase2.py`(9 节点)+ `debug_leak.py`(分路定位) + Codex 两轮复核得到的结论。
 
-- ✅ **B3 通过**：所有节点 `__corro_bookkeeping_gaps`、`corro.sync.client.needed.v2` 不增长
-  (0→0)，无死锁、无无限重请求。**Phase 2 的高风险核心(关 gap)是安全的。**
-- ✅ **sync 过滤生效**：interest 过滤计数器 filtered>0；scored_reduce 对账字节显著低于 random。
-- ❌ **但非关心数据仍遍布全网**：非写入节点上「非关心表」行数 ≈ 满，不是 0。诊断：
-  filtered=2 / kept=12 —— 过滤触发了，但 sync 几乎没机会过滤，因为**数据早被 push 送达**。
+### 现象与三个 bug（系统化排查）
 
-**根因**：corrosion 是 eager-push + epidemic 模型，**收到任何变更即 apply 并 rebroadcast**，
-无接收端过滤。Phase 1 只减 push 扇出、Phase 2 只过滤 sync——只要有一条 push 泄漏
-(coverage 配额 / 多跳 rebroadcast)，非关心数据就被应用并继续扩散，最终全网都有。
-**sender 侧减量(1a+1b)能降「传输冗余」，但不能实现「部分副本(placement)」。**
+- ✅ **B3 安全**：`__corro_bookkeeping_gaps`、`corro.sync.client.needed.v2` 不增长，无死锁。
+  Phase 2 的高风险核心(关 gap)稳。
+- ❌ **非关心数据仍遍布全网**：单独写 battlefield 不漏；与 target 同写就漏到 jam。排查出三因：
+  1. **coverage 配额(=1)**：每次广播兜底发 1 个非关心 peer，epidemic 放大。
+  2. **fallback 全发**：`scored_reduce` 在 `interested` 为空(传播竞态/某表无解析关心者)时
+     `return scored_targets`(全发) → 泄漏且永久。
+  3. **★payload 混表(根因)**：广播会把多条变更攒成一个批次(`bcast_buf`/`bcast_tables` union，
+     `mod.rs`)，且单个 `Changeset::FullV2` 在同一 db_version 内本就能携带多表。
+     selector 按 **union 关心者**(battlefield∪target = strike∪jam)选目标，
+     收方 `uni.rs:67`/`util.rs:1332` **整批无差别 apply** → jam 因要 target 收到整批、连带拿到 battlefield。
 
-### Phase 3（接收端过滤）——实现 placement 的关键，但有正确性难点
+### 关键纠正：接收端过滤对「传输总量」无效
 
-思路：节点 apply 收到的版本时，若该版本不碰本节点任一 interest 表 → **丢弃不存** +
-**不 rebroadcast**(掐断非关心数据的 epidemic) + 记账为「已知」(不再 re-sync)。
+字节在 `uni.rs:59` 读入即计数。接收端再丢只省**存储 + 下游 rebroadcast**，**救不回已发出的字节**。
+→ 此前设想的「Phase 3 接收端过滤」**不是降量正解**，作废。
 
-⚠ **正确性难点(必须先解决)**：节点丢弃版本 V 后若 heads 仍前进、对外宣称「有 V」，
-则关心 V 的 peer M 向它对账时，它 `handle_need` 查不到 V 的数据 → 发 `Changeset::Empty` →
-**M 误以为 V 已满足、永远拿不到真数据**。必须区分「版本空(compacted)」与「我丢弃了/不持有」：
-丢弃的版本**不能**对关心者回 Empty，要么不进 heads、要么回「我没有，问别人」让 M 保持 gap
-向真正持有者(同 interest 的节点)拉。只要同 interest 节点构成连通子图，M 总能从同伴拿到 V。
+### 正解：源端 payload 裁剪（push + sync 都要）
 
-→ Phase 3 是 placement 与「稳定降量」的钥匙，但牵涉 heads/数据可用性，需单独设计+对抗复核。
+降量的唯一不变量：**发给某节点的 payload 字节里，根本不含它不关心的表的行**。
+仅"按表选目标"不够(payload 仍混表)；必须在**序列化 changeset 时按目标 interest 行级过滤**，
+不同 interest 组的节点收**不同 payload**。
+
+**修法优先级（Codex 排序，= 新的 Phase 3 工作线）**：
+1. **源端 payload 裁剪**(必做)：广播序列化时按目标节点 interest 过滤行；不同 interest 组发不同 payload。
+2. **sync 改行级过滤**：`handle_need` 现仅过滤版本、整版 changeset 仍全发；需在 SQL 加
+   `AND "table" IN(interest)`。⚠ 撞 seq 完整性(子集 seq → partial 死锁)，需配 bookie 语义扩展(第 5 项)。
+3. **interest_routing 补 wildcard**：config `interest=[]` 语义是「关心全部」，但路由无 wildcard 条目，
+   fallback 修复后这类全量节点会收不到广播 → 须把空-interest 节点加入所有表的关心集。
+4. **rebroadcast 保持 payload scope**：中继不能把已裁剪 payload 重新混入全局 `bcast_buf`。
+5. **bookie 版本语义扩展(可缓)**：支持动态 interest 变更后的补偿，否则裁剪版本被误判全量 complete。
+
+→ 这是比 Phase 1/2 大的重构，把方案落点从「选目标」纠正到「裁 payload」。需单独立项 + 对抗复核。
+
+### 当前代码状态（整理后）
+
+Phase 1/2 已提交且为干净基线(`selector.rs` `COVERAGE_QUOTA=1`、原 fallback)。
+调试期的 coverage=0 与 fallback 改动**已撤回**(fallback 改动方向对但有 wildcard bug，
+并入上面第 3 项一起做)。诊断工具 `debug_leak.py`、`verify_phase2.py` 保留。
 
 ## 8. 风险与开放问题
 

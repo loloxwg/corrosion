@@ -56,7 +56,7 @@ def main():
         if not H.wait_active(nodes):
             sys.exit("节点未全部 ACTIVE")
         H.write_interest(nodes)
-        time.sleep(6)
+        time.sleep(18)  # 等 interest 充分传播 + 推送端缓存刷新（排除时序竞态）
 
         prefix = f"v{int(time.time())}_"
         for t in H.TABLES:
