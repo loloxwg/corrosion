@@ -57,6 +57,21 @@ corrosion 现在对一次广播只编码**一份 payload**，发给"关心任意
 - Phase 2：sync 版本级过滤 + `Changeset::Empty` 关 gap(B3 已验证不死锁) = 第二步的地基。
 - harness：`run.py`/`sweep.py`(均值+误差带)/`cluster_bench.py`(对照框架) = 量降幅 + 将来 RL 训练/评估环境。
 
+## 6.5 第一步实测 + Codex 复核(已实现，commit "routeA-step1")
+
+**实测**：`verify_phase2.py`(9 节点单表写) 通过——非关心表本地全 0(部分复制达成)、B3 不死锁。
+即单进程内、不用圈子，非关心数据真的没送过来。
+
+**Codex 复核指出的边界(如实记录，多为已知限制/权衡，非阻塞)**：
+1. **多表事务残留**：分组 scope = 单表 Some(T) / 其余 None。**None(多表/0表)仍会合批**，
+   且单条多表 `Changeset` 不拆 → 仍按 union 关心者发。所以"每个 PendingBroadcast 单表"**只对单表广播成立**；
+   多表事务的多张表仍会一起送达(= §4.0 的版本级边界，行级留 step3)。harness 单表写不触发，故 verify 过。
+2. **吞吐权衡**：表交替到达时 flush-on-scope-change 退化为近乎每条一个 PendingBroadcast，批处理收益降低，
+   rebroadcast 路径尤甚。高写入 QPS 下需评估；同表连续写仍合批。
+3. **活性靠 sync 兜底**：interest 已配但某表暂无解析关心者 + COVERAGE_QUOTA=0 → 零目标发送，
+   依赖 anti-entropy 把数据补给关心节点。verify 中 interest 表均收齐 = sync 确实兜上；
+   但属"运行期保证"而非"代码内证明"，大规模/分区下需专门验活性。
+
 ## 7. 风险与开放
 
 - 第一步把"提前序列化"改成"选目标后按组序列化"，序列化次数 ×(interest 组数)，需看吞吐影响。
