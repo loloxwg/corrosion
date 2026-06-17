@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 
 use corro_types::config::BroadcastStrategy;
+use metrics::counter;
 use rand::{rngs::StdRng, seq::IteratorRandom, Rng};
 use tracing::trace;
 
@@ -28,7 +29,7 @@ pub struct Candidate {
 const UNKNOWN_RING: f64 = 4.0; // 未知链路按中等偏差处理，给它被探测的机会
 const JITTER_WEIGHT: f64 = 0.25; // 探索抖动：避免总固定打同几个 peer
 const RELEVANCE_WEIGHT: f64 = 2.0; // 数据相关度：关心该数据的 peer 强加分(压过链路项)
-const COVERAGE_QUOTA: usize = 1; // 减量变体：除关心者外额外保留的覆盖名额(容断兜底/防孤立)
+const COVERAGE_QUOTA: usize = 0; // 减量变体：除关心者外额外保留的覆盖名额(0=严格部分副本,容断靠 sync 兜底)
 
 /// 从候选 peer 中选出最多 k 个作为本次广播目标。
 ///
@@ -88,7 +89,15 @@ fn scored_reduce_targets(
 ) -> Vec<SocketAddr> {
     let interested = interested_set(tables, interest_routing);
     if interested.is_empty() {
-        return scored_targets(candidates, tables, interest_routing, k, rng);
+        // ① 完全没配 interest(关闭态) → 退化为打分式全发(基线行为)。
+        // ② interest 已启用但这些表暂无解析到的关心者(传播竞态/确无关心者)
+        //    → 绝不全发(否则泄漏全网且永久留存)，只发覆盖配额，缺的由 sync 兜底。
+        // 注：config interest=[] 语义为"关心全部"的 wildcard 节点尚未在 interest_routing 体现，
+        //    属已知待办(见 active-push-route-a-design.md §7)，当前实验各节点均显式配 interest。
+        if interest_routing.is_empty() {
+            return scored_targets(candidates, tables, interest_routing, k, rng);
+        }
+        counter!("corro.broadcast.interest.unresolved").increment(1);
     }
     // 非关心者按链路质量(ring 升序，未知排最后)排序，取前 COVERAGE_QUOTA 个做容断兜底。
     let mut others: Vec<Candidate> = candidates
@@ -234,11 +243,12 @@ mod tests {
     }
 
     #[test]
-    fn reduce_coverage_prefers_best_link() {
-        // 覆盖名额应从非关心者里挑链路最好(ring 最小)的那个，做容断兜底。
+    fn reduce_strict_excludes_uninterested() {
+        // COVERAGE_QUOTA=0 严格部分副本：interest 已配置时，非关心者一律不发，
+        // 哪怕链路更好(near ring0)——避免非关心数据泄漏，缺的由 sync 兜底。
         let interested = cand(9000, Some(9));
         let far = cand(9001, Some(9));
-        let near = cand(9002, Some(0)); // 非关心者中链路最好
+        let near = cand(9002, Some(0)); // 非关心者中链路最好，仍不该被选
         let candidates = vec![interested, far, near];
         let mut routing = HashMap::new();
         routing.insert("flight".to_string(), vec![interested.addr]);
@@ -250,10 +260,7 @@ mod tests {
             100,
             &mut rng,
         );
-        assert_eq!(picked.len(), 2);
-        assert!(picked.contains(&interested.addr));
-        assert!(picked.contains(&near.addr), "覆盖名额应选链路最优的 near");
-        assert!(!picked.contains(&far.addr), "链路差的非关心者应被砍掉");
+        assert_eq!(picked, vec![interested.addr], "应只发关心者，非关心者全排除");
     }
 
     #[test]

@@ -508,6 +508,11 @@ async fn handle_broadcasts(
     // mission-aware：与两个缓冲区平行累加各自涉及的表名，split 时随 PendingBroadcast 带出。
     let mut bcast_tables: Vec<String> = Vec::new();
     let mut local_tables: Vec<String> = Vec::new();
+    // 路线A 第1步：按表分组——记录各缓冲当前装的"scope"(Some(单表)/None=多表混合)。
+    // 新广播 scope 与缓冲当前 scope 不同时，先 flush，保证每个 PendingBroadcast 单表，
+    // 不再把不同表的行混进一个 payload 发给 union 关心者(消除混表搭便车泄漏)。
+    let mut bcast_scope: Option<String> = None;
+    let mut local_scope: Option<String> = None;
 
     let mut metrics_interval = interval(Duration::from_secs(10));
 
@@ -627,14 +632,13 @@ async fn handle_broadcasts(
                 };
                 trace!("adding broadcast: {bcast:?}, local? {is_local}");
 
-                // mission-aware：累加这条广播涉及的表，随对应缓冲一起带出。
                 let tables = changeset_tables(&bcast);
-                // 借用累加(iter().cloned())，保留 tables 所有权给下方 to_local_broadcast 带出。
-                if is_local {
-                    local_tables.extend(tables.iter().cloned());
+                // scope = 这条广播的分组键：恰好 1 张表 → Some(表名)；0 或多表 → None(混合)。
+                let this_scope: Option<String> = if tables.len() == 1 {
+                    Some(tables[0].clone())
                 } else {
-                    bcast_tables.extend(tables.iter().cloned());
-                }
+                    None
+                };
 
                 if let Err(e) = (UniPayload::V1 {
                     data: UniPayloadV1::Broadcast(bcast.clone()),
@@ -659,10 +663,20 @@ async fn handle_broadcasts(
 
                     let payload = single_bcast_buf.split().freeze();
 
-                    local_bcast_buf.extend_from_slice(&payload);
+                    // 带上本条广播涉及的表，供 ring0 flood 的 selector 做 interest 减量(逐条，已单表)。
+                    to_local_broadcast.push_front((payload.clone(), tables.clone()));
 
-                    // 带上本条广播涉及的表，供 ring0 flood 的 selector 做 interest 减量。
-                    to_local_broadcast.push_front((payload, tables));
+                    // 批量(非 ring0)路径：scope 变化先 flush，保证 payload 单表。
+                    if !local_bcast_buf.is_empty() && local_scope != this_scope {
+                        to_broadcast.push_front(PendingBroadcast::with_tables(
+                            local_bcast_buf.split().freeze(),
+                            true,
+                            take_tables(&mut local_tables),
+                        ));
+                    }
+                    local_scope = this_scope.clone();
+                    local_bcast_buf.extend_from_slice(&payload);
+                    local_tables.extend(tables.iter().cloned());
 
                     if local_bcast_buf.len() >= broadcast_cutoff {
                         to_broadcast.push_front(PendingBroadcast::with_tables(
@@ -672,11 +686,21 @@ async fn handle_broadcasts(
                         ));
                     }
                 } else {
+                    // 批量(rebroadcast)路径：scope 变化先 flush，保证 payload 单表。
+                    if !bcast_buf.is_empty() && bcast_scope != this_scope {
+                        to_broadcast.push_front(PendingBroadcast::with_tables(
+                            bcast_buf.split().freeze(),
+                            false,
+                            take_tables(&mut bcast_tables),
+                        ));
+                    }
+                    bcast_scope = this_scope.clone();
                     if let Err(e) = bcast_codec.encode(ser_buf.split().freeze(), &mut bcast_buf) {
                         error!("could not encode broadcast: {e}");
                         bcast_buf.clear();
                         continue;
                     }
+                    bcast_tables.extend(tables.iter().cloned());
 
                     if bcast_buf.len() >= broadcast_cutoff {
                         to_broadcast.push_front(PendingBroadcast::with_tables(
