@@ -197,8 +197,9 @@ def run_once(n, rows, strategy):
             print(f"  [{strategy}] 节点未全部 ACTIVE，跳过")
             return None
         write_interest(nodes)
-        # 等 interest 复制到全集群 + 推送端 3s 缓存刷新采纳（在 before 快照之前，不计入度量）
-        time.sleep(6)
+        # 等 interest 复制到全集群 + 推送端 3s 缓存刷新采纳（在 before 快照之前，不计入度量）。
+        # 随规模自适应：节点多时 interest 传播+成员收敛更慢，settle 太短会让早期写入走全发泄漏、压低降幅。
+        time.sleep(int(os.environ.get("SETTLE", max(8, n // 3))))
         before = {nd["i"]: scrape(nd, METRICS) for nd in nodes}
 
         prefix = f"r{int(time.time())}_"
@@ -212,7 +213,7 @@ def run_once(n, rows, strategy):
 
         # 轮询直到每个节点都看到「它关心的表」的全部 rows
         conv = None
-        deadline = time.time() + 30
+        deadline = time.time() + max(30, n)  # 大规模收敛更慢，放宽超时
         while time.time() < deadline:
             if all(node_converged(nd, prefix, rows) for nd in nodes):
                 conv = time.time() - t0
