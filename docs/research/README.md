@@ -12,7 +12,8 @@ crates/                       Corrosion 原代码（基线）
 docs/research/
   README.md                   本文件
   active-push-plan.md         主动推送改造方案 + 对照实验设计（§8 = 1b 前提）
-  active-push-1b-design.md     1b 详细设计：对账按 interest 过滤（数据流/记账/协议）
+  active-push-1b-design.md     1b 详细设计：对账按 interest 过滤（含 §7.5 根因复盘=payload 混表）
+  active-push-cluster-design.md 圈子(cluster)分群实现部分复制——推荐主线，不改 corrosion 内部
   gossipdb-design.md          教学最小实现的设计文档（原理推导）
 sandbox/gossipdb/             自研 200 行教学原型（HLC/CRDT/SWIM/对账全透明）
                               用于吃透 Corrosion 每块在干嘛，非生产代码
