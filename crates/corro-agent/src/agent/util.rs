@@ -183,6 +183,7 @@ pub async fn load_member_states(agent: &Agent) -> Vec<(SocketAddr, Member<Actor>
 
 pub async fn setup_http_api_handler(
     agent: &Agent,
+    transport: Transport,
     tripwire: &mut Tripwire,
     subs_bcast_cache: BcastCache,
     updates_bcast_cache: SharedUpdateBroadcastCache,
@@ -295,6 +296,7 @@ pub async fn setup_http_api_handler(
             tower::ServiceBuilder::new()
                 .layer(Extension(Arc::new(AtomicI64::new(0))))
                 .layer(Extension(agent.clone()))
+                .layer(Extension(transport))
                 .layer(Extension(subs_bcast_cache))
                 .layer(Extension(updates_bcast_cache))
                 .layer(Extension(subs_manager.clone()))

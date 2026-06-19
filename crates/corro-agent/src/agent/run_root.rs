@@ -117,6 +117,7 @@ async fn run(
     // Setup client http API
     let mut http_handles = util::setup_http_api_handler(
         &agent,
+        transport.clone(),
         &mut tripwire,
         subs_bcast_cache,
         updates_bcast_cache,

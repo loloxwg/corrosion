@@ -6,6 +6,7 @@ use std::{
 };
 
 use crate::api::utils::CountedBody;
+use crate::transport::Transport;
 use antithesis_sdk::assert_sometimes;
 use axum::{
     extract::{ConnectInfo, Query},
@@ -15,22 +16,25 @@ use axum::{
 use bytes::{BufMut, BytesMut};
 use compact_str::ToCompactString;
 use corro_types::{
+    actor::ActorId,
     agent::{Agent, ChangeError},
     api::{
         ColumnName, ExecResponse, ExecResult, HealthQuery, HealthResponse, QueryEvent, Statement,
         TableStatRequest, TableStatResponse,
     },
     base::CrsqlDbVersion,
-    broadcast::Timestamp,
+    broadcast::{BiPayload, BiPayloadV1, Timestamp},
     change::{insert_local_changes, InsertChangesInfo, SqliteValue},
     persistent_gauge,
     sqlite::SqlitePoolError,
 };
+use futures::SinkExt;
 use hyper::StatusCode;
 use metrics::{counter, histogram};
 use rusqlite::{params_from_iter, ToSql, Transaction};
 use serde::Deserialize;
 use spawn::spawn_counted;
+use speedy::Writable;
 use sqlite_pool::{Committable, InterruptibleTransaction, SqliteConn};
 
 use tokio::{
@@ -39,7 +43,10 @@ use tokio::{
         oneshot,
     },
     task::block_in_place,
+    time::timeout,
 };
+use tokio_stream::StreamExt;
+use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use tracing::{debug, error, trace, warn};
 
 use corro_types::broadcast::broadcast_changes;
@@ -271,6 +278,294 @@ pub enum QueryError {
     Rusqlite(#[from] rusqlite::Error),
 }
 
+// Prototype query routing only extracts straightforward SELECT table references
+// such as `SELECT ... FROM table ...`. JOINs, subqueries, CTEs, and quoted edge
+// cases need a real sqlite3_parser pass before this is production-complete.
+fn referenced_tables(sql: &str) -> Vec<String> {
+    const CLAUSE_END: &[&str] = &[
+        "where",
+        "group",
+        "order",
+        "limit",
+        "having",
+        "union",
+        "intersect",
+        "except",
+    ];
+
+    let tokens = sql_tokens(sql);
+    let mut tables = BTreeSet::new();
+    let mut idx = 0;
+
+    while idx < tokens.len() {
+        if !tokens[idx].eq_ignore_ascii_case("from") {
+            idx += 1;
+            continue;
+        }
+
+        idx += 1;
+        while idx < tokens.len() {
+            let token = tokens[idx].as_str();
+            let lower = token.to_ascii_lowercase();
+            if CLAUSE_END.contains(&lower.as_str()) || lower == "join" || lower == "on" {
+                break;
+            }
+            if token == "," {
+                idx += 1;
+                continue;
+            }
+            if token == "(" {
+                break;
+            }
+            if let Some(table) = normalize_table_token(token) {
+                tables.insert(table);
+            }
+
+            idx += 1;
+            while idx < tokens.len() && tokens[idx] != "," {
+                let lower = tokens[idx].to_ascii_lowercase();
+                if CLAUSE_END.contains(&lower.as_str()) || lower == "join" || lower == "on" {
+                    break;
+                }
+                idx += 1;
+            }
+        }
+    }
+
+    tables.into_iter().collect()
+}
+
+fn sql_tokens(sql: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut chars = sql.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' => {
+                for next in chars.by_ref() {
+                    if next == '\'' {
+                        break;
+                    }
+                }
+            }
+            '"' | '`' => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+                let quote = ch;
+                let mut quoted = String::new();
+                for next in chars.by_ref() {
+                    if next == quote {
+                        break;
+                    }
+                    quoted.push(next);
+                }
+                if !quoted.is_empty() {
+                    tokens.push(quoted);
+                }
+            }
+            '[' => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+                let mut bracketed = String::new();
+                for next in chars.by_ref() {
+                    if next == ']' {
+                        break;
+                    }
+                    bracketed.push(next);
+                }
+                if !bracketed.is_empty() {
+                    tokens.push(bracketed);
+                }
+            }
+            ',' | '(' | ')' => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+                tokens.push(ch.to_string());
+            }
+            ch if ch.is_whitespace() || ch == ';' => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    tokens
+}
+
+fn normalize_table_token(token: &str) -> Option<String> {
+    let table = token
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`' | '[' | ']'))
+        .rsplit('.')
+        .next()
+        .unwrap_or(token)
+        .trim();
+
+    if table.is_empty() {
+        None
+    } else {
+        Some(table.to_ascii_lowercase())
+    }
+}
+
+async fn resolve_table_holder(agent: &Agent, table: &str) -> Option<SocketAddr> {
+    let conn = match agent.pool().read().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            warn!("query routing: could not acquire connection for node_interest lookup: {e}");
+            return None;
+        }
+    };
+
+    block_in_place(|| {
+        let actor_ids: Vec<ActorId> = {
+            let mut stmt = match conn.prepare_cached(
+                "SELECT actor_id FROM node_interest WHERE table_name = ? AND active = 1",
+            ) {
+                Ok(stmt) => stmt,
+                Err(e) => {
+                    warn!("query routing: could not prepare node_interest lookup: {e}");
+                    return None;
+                }
+            };
+
+            let actor_ids = match stmt.query_map([table], |row| row.get::<_, ActorId>(0)) {
+                Ok(rows) => rows.filter_map(Result::ok).collect(),
+                Err(e) => {
+                    warn!("query routing: could not query node_interest for {table}: {e}");
+                    return None;
+                }
+            };
+            actor_ids
+        };
+
+        let self_actor_id = agent.actor_id();
+        let cluster_id = agent.cluster_id();
+        let members = agent.members().read();
+        actor_ids.into_iter().find_map(|actor_id| {
+            if actor_id == self_actor_id {
+                return None;
+            }
+
+            members.states.get(&actor_id).and_then(|state| {
+                if state.cluster_id == cluster_id && state.addr != agent.gossip_addr() {
+                    Some(state.addr)
+                } else {
+                    None
+                }
+            })
+        })
+    })
+}
+
+async fn send_query_error(data_tx: &mpsc::Sender<QueryEvent>, message: impl ToString) {
+    let _ = data_tx
+        .send(QueryEvent::Error(message.to_string().to_compact_string()))
+        .await;
+}
+
+async fn relay_query_forward(
+    agent: Agent,
+    transport: Transport,
+    holder_addr: SocketAddr,
+    stmt: Statement,
+    data_tx: mpsc::Sender<QueryEvent>,
+    timeout_secs: Option<u64>,
+) {
+    if let Err(e) = relay_query_forward_inner(
+        agent,
+        transport,
+        holder_addr,
+        stmt,
+        data_tx.clone(),
+        timeout_secs,
+    )
+    .await
+    {
+        send_query_error(&data_tx, e).await;
+    }
+}
+
+async fn relay_query_forward_inner(
+    agent: Agent,
+    transport: Transport,
+    holder_addr: SocketAddr,
+    stmt: Statement,
+    data_tx: mpsc::Sender<QueryEvent>,
+    timeout_secs: Option<u64>,
+) -> Result<(), String> {
+    let (send, recv) = transport
+        .open_bi(holder_addr)
+        .await
+        .map_err(|e| format!("query routing: could not open bi stream to {holder_addr}: {e}"))?;
+
+    let statement_json = serde_json::to_vec(&stmt)
+        .map_err(|e| format!("query routing: could not encode statement: {e}"))?;
+    let payload = BiPayload::V1 {
+        data: BiPayloadV1::QueryForward { statement_json },
+        cluster_id: agent.cluster_id(),
+    };
+
+    let mut encode_buf = BytesMut::new();
+    payload
+        .write_to_stream((&mut encode_buf).writer())
+        .map_err(|e| format!("query routing: could not encode BiPayload: {e}"))?;
+
+    let mut write = FramedWrite::new(
+        send,
+        LengthDelimitedCodec::builder()
+            .max_frame_length(100 * 1_024 * 1_024)
+            .new_codec(),
+    );
+    write
+        .send(encode_buf.freeze())
+        .await
+        .map_err(|e| format!("query routing: could not write QueryForward: {e}"))?;
+    write
+        .flush()
+        .await
+        .map_err(|e| format!("query routing: could not flush QueryForward: {e}"))?;
+    let mut send = write.into_inner();
+    let _ = send.finish();
+
+    let mut read = FramedRead::new(
+        recv,
+        LengthDelimitedCodec::builder()
+            .max_frame_length(100 * 1_024 * 1_024)
+            .new_codec(),
+    );
+    let read_timeout = Duration::from_secs(timeout_secs.unwrap_or(60).max(1));
+
+    loop {
+        let frame = timeout(read_timeout, StreamExt::next(&mut read))
+            .await
+            .map_err(|_| format!("query routing: timed out waiting for {holder_addr}"))?;
+
+        let Some(frame) = frame else {
+            break;
+        };
+        let frame =
+            frame.map_err(|e| format!("query routing: could not read from {holder_addr}: {e}"))?;
+        let qe = serde_json::from_slice::<QueryEvent>(&frame)
+            .map_err(|e| format!("query routing: bad QueryEvent from {holder_addr}: {e}"))?;
+
+        if data_tx.send(qe).await.is_err() {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
 // 查询路由(4.4.2)复用：持有者侧 bi.rs 收到 QueryForward 后调它本地执行 + 产 QueryEvent。
 pub(crate) async fn build_query_rows_response(
     agent: &Agent,
@@ -457,6 +752,7 @@ pub(crate) async fn build_query_rows_response(
 
 pub async fn api_v1_queries(
     Extension(agent): Extension<Agent>,
+    Extension(transport): Extension<Transport>,
     ConnectInfo(client_addr): ConnectInfo<SocketAddr>,
     axum::extract::Query(params): axum::extract::Query<TimeoutParams>,
     axum::extract::Json(stmt): axum::extract::Json<Statement>,
@@ -503,7 +799,41 @@ pub async fn api_v1_queries(
     trace!("building query rows response...");
     assert_sometimes!(true, "Corrosion accepts queries");
 
-    match build_query_rows_response(&agent, client_addr, data_tx, stmt, params.timeout).await {
+    let route_table = {
+        let my_interest = agent.config().gossip.interest.clone();
+        if my_interest.is_empty() {
+            None
+        } else {
+            let my_interest = my_interest.into_iter().collect::<BTreeSet<_>>();
+            referenced_tables(stmt.query())
+                .into_iter()
+                .find(|table| !my_interest.contains(table))
+        }
+    };
+
+    let query_res = if let Some(table) = route_table {
+        match resolve_table_holder(&agent, &table).await {
+            Some(holder_addr) => {
+                tokio::spawn(relay_query_forward(
+                    agent.clone(),
+                    transport,
+                    holder_addr,
+                    stmt,
+                    data_tx,
+                    params.timeout,
+                ));
+                Ok(())
+            }
+            None => {
+                send_query_error(&data_tx, format!("no holder found for table {table}")).await;
+                Ok(())
+            }
+        }
+    } else {
+        build_query_rows_response(&agent, client_addr, data_tx, stmt, params.timeout).await
+    };
+
+    match query_res {
         Ok(_) => {
             histogram!("corro.api.queries.processing.time.seconds", "result" => "success")
                 .record(start.elapsed());
@@ -805,8 +1135,13 @@ mod tests {
 
         println!("transaction body: {body:?}");
 
+        let (rtt_tx, _rtt_rx) = tokio::sync::mpsc::channel(1);
+        let gossip_config = agent.config().gossip.clone();
+        let transport = Transport::new(&gossip_config, rtt_tx).await?;
+
         let res = api_v1_queries(
             Extension(agent.clone()),
+            Extension(transport),
             ConnectInfo("127.0.0.1:1234".parse().unwrap()),
             axum::extract::Query(TimeoutParams { timeout: None }),
             axum::Json(Statement::Simple("select * from tests".into())),
