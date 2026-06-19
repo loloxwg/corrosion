@@ -271,7 +271,8 @@ pub enum QueryError {
     Rusqlite(#[from] rusqlite::Error),
 }
 
-async fn build_query_rows_response(
+// 查询路由(4.4.2)复用：持有者侧 bi.rs 收到 QueryForward 后调它本地执行 + 产 QueryEvent。
+pub(crate) async fn build_query_rows_response(
     agent: &Agent,
     client_addr: SocketAddr,
     data_tx: mpsc::Sender<QueryEvent>,

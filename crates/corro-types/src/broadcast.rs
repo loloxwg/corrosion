@@ -71,6 +71,13 @@ pub enum BiPayloadV1 {
         #[speedy(default_on_eof)]
         interest: Option<Vec<String>>,
     },
+    /// 查询路由(4.4.2)：部分复制后本地没有的表，把查询转发给持有它的节点，
+    /// 对方本地执行并把结果行流式回传。详见 docs/research/active-push-query-routing-design.md。
+    QueryForward {
+        /// 整条 Statement 的 serde_json 字节(含 SQL + 任意参数形式)。
+        /// 用 JSON 字节承载，避免 speedy(BiPayload) 与 serde(Statement) 两套序列化裸接触。
+        statement_json: Vec<u8>,
+    },
 }
 
 #[derive(Debug)]

@@ -1,14 +1,16 @@
 use crate::api::peer::serve_sync;
 use corro_types::{
     agent::{Agent, Bookie},
+    api::Statement,
     broadcast::{BiPayload, BiPayloadV1},
 };
+use futures::SinkExt;
 use metrics::counter;
 use speedy::Readable;
 use std::time::Duration;
 use tokio::time::timeout;
 use tokio_stream::StreamExt;
-use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
+use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use tracing::{debug, error, trace, warn};
 use tripwire::Tripwire;
 
@@ -52,6 +54,7 @@ pub fn spawn_bipayload_handler(
             );
 
             // TODO: implement concurrency limit for sync requests
+            let remote = conn.remote_address();
             tokio::spawn({
                 let agent = agent.clone();
                 let bookie = bookie.clone();
@@ -97,6 +100,53 @@ pub fn spawn_bipayload_handler(
                                                         {
                                                             warn!("could not complete receiving sync: {e}");
                                                         }
+                                                        break;
+                                                    }
+                                                    BiPayloadV1::QueryForward {
+                                                        statement_json,
+                                                    } => {
+                                                        // 持有者侧(4.4.2)：本地执行转发来的查询，结果行流式回传。
+                                                        let stmt: Statement = match serde_json::from_slice(&statement_json) {
+                                                            Ok(s) => s,
+                                                            Err(e) => {
+                                                                warn!("query forward: bad statement json: {e}");
+                                                                break;
+                                                            }
+                                                        };
+                                                        let (qe_tx, mut qe_rx) =
+                                                            tokio::sync::mpsc::channel(512);
+                                                        let agent2 = agent.clone();
+                                                        tokio::spawn(async move {
+                                                            if let Err(e) = crate::api::public::build_query_rows_response(
+                                                                &agent2, remote, qe_tx, stmt, Some(30),
+                                                            )
+                                                            .await
+                                                            {
+                                                                warn!("query forward: local exec failed: {e:?}");
+                                                            }
+                                                        });
+                                                        let mut w = FramedWrite::new(
+                                                            tx,
+                                                            LengthDelimitedCodec::builder()
+                                                                .max_frame_length(100 * 1_024 * 1_024)
+                                                                .new_codec(),
+                                                        );
+                                                        while let Some(qe) = qe_rx.recv().await {
+                                                            match serde_json::to_vec(&qe) {
+                                                                Ok(bytes) => {
+                                                                    if let Err(e) =
+                                                                        w.send(bytes.into()).await
+                                                                    {
+                                                                        warn!("query forward: send back failed: {e}");
+                                                                        break;
+                                                                    }
+                                                                }
+                                                                Err(e) => warn!(
+                                                                    "query forward: serialize failed: {e}"
+                                                                ),
+                                                            }
+                                                        }
+                                                        let _ = w.into_inner().finish();
                                                         break;
                                                     }
                                                 },
