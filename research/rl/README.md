@@ -26,16 +26,22 @@ python3 baselines.py   # 基线对照：greedy 比 rule 省 ~65%(规则基线明
 python3 model.py       # GNN 监督训练 + 在新态势上对比
 ```
 
-## 已得结果(里程碑 4)
+## 已得结果
 
-GNN 在 **30 个未见过的态势**上：成本 152.3 = greedy 152.3 ≪ rule 437.9 →
-**比规则基线省 65%，精确达到近最优 greedy 上限**。即 GNN 学到了适配度评分函数、
-泛化到新态势，且是"一次前向"的快速评分(greedy 是逐态势穷搜，慢)。
+**里程碑 4(监督学评分函数)**：GNN 在 **30 个未见态势**上成本 152.3 = greedy 152.3 ≪ rule 437.9
+→ 比规则基线省 65%、精确达近最优 greedy 上限。GNN 学到适配度评分函数、泛化到新态势,
+且"一次前向"即出(greedy 逐态势穷搜)。`python3 model.py`
 
-## 下一步(里程碑 5+)
+**里程碑 5(RL 微调,DRL 的价值)**：引入**链路方差**(有些平台便宜但不稳),真实成本含风险项
+`均值 + RISK×方差`。greedy/监督 GNN 只看均值(方差盲)。`rl.py` 用风险成本当奖励 REINFORCE 微调:
+- rule 1011 / greedy(方差盲) 330 / 监督 GNN 332 / **GNN+RL 317**
+- **RL 比 greedy 省 4%、比 rule 省 69%** —— RL 学会用方差特征避开"便宜但不稳"的链路,
+  这是方差盲的 greedy 和模仿它的监督 GNN 都做不到的。**DRL 在不确定态势下的鲁棒性价值被证明。**
+`python3 rl.py`
 
-- **RL 微调**(PPO/REINFORCE)：在**扰动/动态态势**(链路通断、任务重指派、不确定性)下，
-  学出比静态 greedy 更鲁棒的策略——greedy 是逐态势穷搜、不抗扰动，RL 该在这胜出。
-- **score heatmap 可视化**(交付证据)：数据-平台适配度热图 + 态势变化前后 score 变化。
-- **消融**(无GNN/规则only/GNN监督/GNN+RL)归因。
-- **sim-to-real**：学到的 placement 注入 `node_interest` 跑 harness，核对 sim 与真机。
+## 下一步(收口/报告)
+
+- **score heatmap 可视化**(交付证据)：数据-平台适配度热图 + 态势/方差变化前后 score 变化。
+- **消融**(无GNN / 规则only / GNN监督 / GNN+RL)归因提升来源。
+- **sim-to-real**：学到的 placement 注入 `node_interest` 跑 harness，核对 sim 与真机字节趋势。
+- 技术研究报告(对接合同 4.2.3/4.3.3)。

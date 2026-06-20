@@ -25,10 +25,11 @@ def situation_tensors(sit: Situation):
     """态势 → 张量：平台特征、数据特征、需要者/critical 邻接、链路成本。"""
     P, D = sit.n, sit.D
     role_idx = {r: i for i, r in enumerate(ROLES)}
-    plat_feat = np.zeros((P, len(ROLES) + 1), dtype=np.float32)
+    plat_feat = np.zeros((P, len(ROLES) + 2), dtype=np.float32)
     for p in range(P):
         plat_feat[p, role_idx[sit.roles[p]]] = 1.0
-        plat_feat[p, -1] = sit.link_cost[p]
+        plat_feat[p, len(ROLES)] = sit.link_cost[p]      # 链路均值
+        plat_feat[p, len(ROLES) + 1] = sit.link_var[p]   # 链路方差(RL 学着用它避坑)
     data_feat = np.zeros((D, 2), dtype=np.float32)
     needer = np.zeros((D, P), dtype=np.float32)
     critical = np.zeros((D, P), dtype=np.float32)
@@ -45,6 +46,7 @@ def situation_tensors(sit: Situation):
         "needer": torch.tensor(needer),
         "critical": torch.tensor(critical),
         "link": torch.tensor(sit.link_cost, dtype=torch.float32),
+        "link_var": torch.tensor(sit.link_var, dtype=torch.float32),
     }
 
 
@@ -54,13 +56,13 @@ class BipartiteGNN(nn.Module):
     def __init__(self, h=32, rounds=2):
         super().__init__()
         self.rounds = rounds
-        self.plat_enc = nn.Linear(len(ROLES) + 1, h)
+        self.plat_enc = nn.Linear(len(ROLES) + 2, h)
         self.data_enc = nn.Linear(2, h)
         self.upd_plat = nn.ModuleList(nn.Linear(2 * h, h) for _ in range(rounds))
         self.upd_data = nn.ModuleList(nn.Linear(2 * h, h) for _ in range(rounds))
-        # 逐 (d,p) 打分：[h_d, h_p, 链路, needer, critical, write, query]
+        # 逐 (d,p) 打分：[h_d, h_p, 链路均值, 链路方差, needer, critical, write, query]
         self.score = nn.Sequential(
-            nn.Linear(2 * h + 5, h), nn.ReLU(), nn.Linear(h, 1),
+            nn.Linear(2 * h + 6, h), nn.ReLU(), nn.Linear(h, 1),
         )
 
     def forward(self, t):
@@ -79,10 +81,11 @@ class BipartiteGNN(nn.Module):
         hd_e = hd.unsqueeze(1).expand(D, P, -1)        # D × P × h
         hp_e = hp.unsqueeze(0).expand(D, P, -1)        # D × P × h
         edge = torch.stack([
-            t["link"].unsqueeze(0).expand(D, P),       # 链路成本
+            t["link"].unsqueeze(0).expand(D, P),       # 链路均值
+            t["link_var"].unsqueeze(0).expand(D, P),   # 链路方差
             t["needer"], t["critical"],
             data[:, 0:1].expand(D, P), data[:, 1:2].expand(D, P),  # write, query
-        ], dim=-1)                                     # D × P × 5
+        ], dim=-1)                                     # D × P × 6
         feat = torch.cat([hd_e, hp_e, edge], dim=-1)
         return self.score(feat).squeeze(-1)            # D × P (logits)
 

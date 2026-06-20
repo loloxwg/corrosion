@@ -37,6 +37,10 @@ class Situation:
         # 每平台链路/存储成本：差链路(远/丢包/低带宽)上存数据更贵。
         # 真实来源 500Kbps + RTT 差异;这让"存在哪个平台"有差别(RL 该挑便宜链路)。
         self.link_cost = rng.uniform(0.5, 2.5, self.n)
+        # 链路**方差**：有些平台均值便宜但不稳(时好时坏/通断风险)。
+        # 真实成本 = 均值 + 风险权重×方差;greedy 只看均值会踩"便宜但不稳"的坑,
+        # RL 看方差能避开 → 这才给 DRL 留出胜出空间(里程碑5)。
+        self.link_var = rng.uniform(0.0, 2.0, self.n)
 
         # 数据类型：(名字, 写量, 单平台查询量, 需要者角色, critical 比例)
         # 遥测=高写低查、窄需求;目标=低写高查、宽需求 —— 制造权衡。
@@ -91,6 +95,20 @@ class Situation:
             routed = spec["needers"] - set(holders)
             query += len(routed) * spec["query_vol"] * self.route_cost
         return push + query, {"push": push, "query": query}
+
+    def cost_risk(self, placement, risk=0.0):
+        """鲁棒成本：用 effective_link = link_cost + risk×link_var(风险厌恶)。
+        risk=0 → 退化为标称 cost(greedy 用的);risk>0 → 惩罚"便宜但不稳"的高方差链路。"""
+        eff = self.link_cost + risk * self.link_var
+        push = query = 0.0
+        for d, holders in enumerate(placement):
+            spec = self.data[d]
+            wv = spec["write_vol"] * self.write_jitter[d]
+            link_sum = sum(eff[p] for p in holders)
+            push += wv * link_sum * (max(len(holders), 1) ** (self.push_amp - 1.0))
+            routed = spec["needers"] - set(holders)
+            query += len(routed) * spec["query_vol"] * self.route_cost
+        return push + query
 
     def feasible(self, placement):
         """硬约束检查：critical 都在、持有者数 ≥min_replicas。"""
