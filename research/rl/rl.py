@@ -58,21 +58,24 @@ def pretrain(model, sits, epochs=50):
             opt.zero_grad(); loss.backward(); opt.step()
 
 
-def rl_finetune(model, sits, iters=40):
-    """REINFORCE:奖励=-扰动成本;基线=滑动均值降方差。从预训练 GNN 出发微调。"""
-    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+def rl_finetune(model, sits, iters=60, K=5):
+    """REINFORCE + **每态势自评基线**(self-critical):每态势采 K 个 placement,
+    基线=这 K 个成本均值 → 优势只反映"比本态势平均好多少",消掉态势间量级差异(300~1000),
+    方差大降、稳定。从预训练 GNN 出发微调(lr 小,只学方差感知这类增量)。"""
+    opt = torch.optim.Adam(model.parameters(), lr=3e-4)
     rng = np.random.default_rng(0)
-    baseline = None
     for it in range(iters):
         np.random.shuffle(sits)
-        for i, sit in enumerate(sits):
+        for sit in sits:
             scores = model(situation_tensors(sit))
-            placement, logp = sample_placement(sit, scores, rng)
-            cost = robust_cost(sit, placement)
-            reward = -cost
-            baseline = reward if baseline is None else 0.9 * baseline + 0.1 * reward
-            adv = reward - baseline
-            loss = -(logp * adv)
+            samples = [sample_placement(sit, scores, rng) for _ in range(K)]
+            costs = np.array([robust_cost(sit, pl) for pl, _ in samples])
+            baseline = costs.mean()
+            loss = 0.0
+            for (pl, logp), c in zip(samples, costs):
+                adv = -(c - baseline)          # reward=-c; 优势=-(c-基线)
+                loss = loss - logp * adv
+            loss = loss / K
             opt.zero_grad(); loss.backward(); opt.step()
 
 
