@@ -65,16 +65,21 @@ fn random_targets(candidates: &[Candidate], k: usize, rng: &mut StdRng) -> Vec<S
 }
 
 /// 这条 mutation 的"关心者"集合 = 涉及表的兴趣 addr 之并。
+/// wildcard:声明 `*`(关心全部)的 peer 以特殊键 `"*"` 存在 routing 里,任何广播都并入它。
 fn interested_set(
     tables: &[String],
     interest_routing: &HashMap<String, Vec<SocketAddr>>,
 ) -> HashSet<SocketAddr> {
-    tables
+    let mut set: HashSet<SocketAddr> = tables
         .iter()
         .filter_map(|t| interest_routing.get(t))
         .flatten()
         .copied()
-        .collect()
+        .collect();
+    if let Some(all) = interest_routing.get("*") {
+        set.extend(all.iter().copied());
+    }
+    set
 }
 
 /// 减量变体（对接 4.4.3）：先把候选池缩到「关心者 + 少量覆盖配额」，再在缩小的池子里打分取 Top-K。
@@ -92,8 +97,8 @@ fn scored_reduce_targets(
         // ① 完全没配 interest(关闭态) → 退化为打分式全发(基线行为)。
         // ② interest 已启用但这些表暂无解析到的关心者(传播竞态/确无关心者)
         //    → 绝不全发(否则泄漏全网且永久留存)，只发覆盖配额，缺的由 sync 兜底。
-        // 注：config interest=[] 语义为"关心全部"的 wildcard 节点尚未在 interest_routing 体现，
-        //    属已知待办(见 active-push-route-a-design.md §7)，当前实验各节点均显式配 interest。
+        // 注：关心全部的节点请显式配 interest=["*"]→以特殊键 "*" 进 interest_routing,
+        //    被 interested_set 并入(见上),每张表都会推给它。空 interest=[] 仍为旧的隐式全量。
         if interest_routing.is_empty() {
             return scored_targets(candidates, tables, interest_routing, k, rng);
         }
@@ -261,6 +266,25 @@ mod tests {
             &mut rng,
         );
         assert_eq!(picked, vec![interested.addr], "应只发关心者，非关心者全排除");
+    }
+
+    #[test]
+    fn wildcard_peer_receives_every_table() {
+        // 声明 "*"(关心全部)的 peer,无论广播哪张表都应被选中——哪怕它没精确关心该表。
+        let star = cand(9000, Some(9)); // 链路差,但 wildcard 关心全部,仍必入
+        let other = cand(9001, Some(0)); // 链路好但不关心 battlefield,严格部分副本下应排除
+        let candidates = vec![star, other];
+        let mut routing = HashMap::new();
+        routing.insert("*".to_string(), vec![star.addr]);
+        let mut rng = StdRng::seed_from_u64(5);
+        let picked = scored_reduce_targets(
+            &candidates,
+            &["battlefield".to_string()],
+            &routing,
+            100,
+            &mut rng,
+        );
+        assert_eq!(picked, vec![star.addr], "wildcard peer 必收任意表,非关心者排除");
     }
 
     #[test]

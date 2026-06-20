@@ -99,8 +99,14 @@ RL 决策的 placement 经 gossip 在容断网络中分发,查询路由也走同
 (`run_root.rs::write_own_interest`),不再依赖外部/harness 写入,且启动即可见(减轻传播竞态)。
 `SKIP_WRITE_INTEREST=1 verify_phase2.py` 验证:全靠 corrosion 自写,部分复制仍 PASS。
 
+**interest wildcard(本轮收口)**:`interest=["*"]` = 关心全部(= 全量节点),与精确表名两种语义。
+无需模式匹配,本质是「把该节点当全量节点处理」:推送端 `interested_set` 把 `*` 关心者并入每张表;
+对账 `interest_for_sync` 见 `*` 返回 None(不过滤);查询端 `*` 节点全本地查、且可做任意表持有者
+(`resolve_table_holder` 匹配 `table=? OR '*'`)。`wildcard_test.py` 实测:`*` 节点本地收全 3 表、
+共存的 jam 节点仍只有 target(部分复制不被破坏)、jam 经路由从 `*` 持有者取回 flight。
+
 **未尽事项(诚实)**:① 1M QPS 压测/缓存;② RL 链路优势的注入延迟端到端验证;
-③ 单事务多表的行级精度(scoped bookie,高风险);④ interest 的 wildcard/动态变更;⑤ 更大规模(100 节点)。
+③ 单事务多表的行级精度(scoped bookie,高风险);④ interest 的动态变更/历史回填;⑤ 更大规模(100 节点)。
 
 **方法学**:全程"设计 → Codex 对抗复核 → 实现 → 实测(重复均值)→ 诚实记录(含失败)",
 多处靠 Codex 复核纠偏(payload 混表根因、一进程约束下路线选择、RL 奖励 hacking 防护、稳定化)。

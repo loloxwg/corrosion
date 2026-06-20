@@ -428,8 +428,10 @@ async fn resolve_table_holder(agent: &Agent, table: &str) -> Option<SocketAddr> 
 
     block_in_place(|| {
         let actor_ids: Vec<ActorId> = {
+            // wildcard "*" 节点存全部 → 可做任意表的持有者(回退/兜底路由目标)。
             let mut stmt = match conn.prepare_cached(
-                "SELECT actor_id FROM node_interest WHERE table_name = ? AND active = 1",
+                "SELECT actor_id FROM node_interest \
+                 WHERE (table_name = ? OR table_name = '*') AND active = 1",
             ) {
                 Ok(stmt) => stmt,
                 Err(e) => {
@@ -801,7 +803,8 @@ pub async fn api_v1_queries(
 
     let route_table = {
         let my_interest = agent.config().gossip.interest.clone();
-        if my_interest.is_empty() {
+        // 空 interest 或含 wildcard "*" → 本节点存全部 → 一律本地查,不路由。
+        if my_interest.is_empty() || my_interest.iter().any(|t| t == "*") {
             None
         } else {
             let my_interest = my_interest.into_iter().collect::<BTreeSet<_>>();

@@ -385,7 +385,8 @@ fn interest_for_sync(agent: &Agent) -> Option<Vec<String>> {
         return None;
     }
     let interest = cfg.gossip.interest.clone();
-    if interest.is_empty() {
+    // 空 interest 或含 wildcard "*" → 关心全部 → None(不过滤,全量对账,等价上游)。
+    if interest.is_empty() || interest.iter().any(|t| t == "*") {
         None
     } else {
         Some(interest)
