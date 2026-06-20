@@ -430,6 +430,35 @@ fn handle_need(
     ",
     )?;
 
+    // interest 版本级过滤辅助(1b)：版本(已应用 crsql_changes 或缓冲 __corro_buffered_changes)
+    // 涉及的任一表命中 interest → 保留整版；全不命中 → 过滤(交由调用方发 Changeset::Empty 关 gap)。
+    // 无任何行(纯空/gap) → 不在此过滤,交后续空/gap 逻辑。node_interest 恒在 interest 集合内。
+    // ★所有 serving 分支(Full crsql/Full buffered/Partial crsql/Partial buffered)都走它,
+    //  否则中转节点在 buffered 窗口或 Partial 请求下把非关心表原始行直发 → 系统性泄漏。
+    let touches_interest = |version: CrsqlDbVersion| -> rusqlite::Result<bool> {
+        let interest_set = match interest {
+            Some(s) => s,
+            None => return Ok(true), // 全量(上游行为),不过滤
+        };
+        let mut stmt = tx.prepare_cached(
+            r#"SELECT "table" FROM crsql_changes
+                   WHERE site_id = :actor_id AND db_version = :version
+               UNION
+               SELECT "table" FROM __corro_buffered_changes
+                   WHERE site_id = :actor_id AND db_version = :version"#,
+        )?;
+        let mut q = stmt.query(named_params! { ":actor_id": actor_id, ":version": version })?;
+        let (mut found, mut hit) = (false, false);
+        while let Some(row) = q.next()? {
+            found = true;
+            if interest_set.contains(&row.get::<_, String>(0)?) {
+                hit = true;
+                break;
+            }
+        }
+        Ok(hit || !found)
+    };
+
     match need {
         SyncNeedV1::Full { versions } => {
             let mut rows = prepped.query(named_params! {
@@ -546,6 +575,13 @@ fn handle_need(
                         continue;
                     }
 
+                    // interest 过滤:缓冲版本不命中 interest → 当空版本关 gap,不转发原始行(降量、防泄漏)。
+                    if !touches_interest(version)? {
+                        counter!("corro.sync.interest.filtered.versions").increment(1);
+                        empties.insert(version..=version);
+                        continue;
+                    }
+
                     let seqs = tx
                         .prepare_cached("
                         SELECT start_seq, end_seq, last_seq, ts FROM __corro_seq_bookkeeping WHERE site_id = :actor_id AND db_version = :db_version
@@ -612,9 +648,14 @@ fn handle_need(
                     let ts: Timestamp = row.get(2)?;
                     trace!(%version, %last_seq, "got a row from crsql_change!");
 
-                    for range_needed in seqs {
-                        let mut prepped = tx.prepare_cached(
-                            r#"
+                    // interest 过滤:版本不命中 interest → 当空版本关 gap,不转发原始行(降量、防泄漏)。
+                    if !touches_interest(version)? {
+                        counter!("corro.sync.interest.filtered.versions").increment(1);
+                        empties.insert(version..=version);
+                    } else {
+                        for range_needed in seqs {
+                            let mut prepped = tx.prepare_cached(
+                                r#"
                                 SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
                                     FROM crsql_changes
                                     WHERE site_id = :actor_id
@@ -622,31 +663,32 @@ fn handle_need(
                                       AND seq BETWEEN :start AND :end
                                     ORDER BY seq ASC
                             "#,
-                        )?;
+                            )?;
 
-                        let rows = prepped.query_map(
-                            named_params! {
-                                ":actor_id": actor_id,
-                                ":version": version,
-                                ":start": range_needed.start(),
-                                ":end": range_needed.end(),
-                            },
-                            row_to_change,
-                        )?;
+                            let rows = prepped.query_map(
+                                named_params! {
+                                    ":actor_id": actor_id,
+                                    ":version": version,
+                                    ":start": range_needed.start(),
+                                    ":end": range_needed.end(),
+                                },
+                                row_to_change,
+                            )?;
 
-                        send_change_chunks(
-                            sender,
-                            ChunkedChanges::new(
-                                rows,
-                                range_needed.start(),
-                                range_needed.end(),
-                                MAX_CHANGES_BYTES_PER_MESSAGE,
-                            ),
-                            actor_id,
-                            version,
-                            last_seq,
-                            ts,
-                        )?;
+                            send_change_chunks(
+                                sender,
+                                ChunkedChanges::new(
+                                    rows,
+                                    range_needed.start(),
+                                    range_needed.end(),
+                                    MAX_CHANGES_BYTES_PER_MESSAGE,
+                                ),
+                                actor_id,
+                                version,
+                                last_seq,
+                                ts,
+                            )?;
+                        }
                     }
                 }
                 None => {
@@ -682,7 +724,11 @@ fn handle_need(
                         empties.insert(version..=version);
                     }
 
-                    if buffered {
+                    // interest 过滤:缓冲版本不命中 interest → 当空版本关 gap,不转发原始行(降量、防泄漏)。
+                    if buffered && !touches_interest(version)? {
+                        counter!("corro.sync.interest.filtered.versions").increment(1);
+                        empties.insert(version..=version);
+                    } else if buffered {
                         for seqs_range in seqs {
                             let seqs = tx
                                 .prepare_cached(

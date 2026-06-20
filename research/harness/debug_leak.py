@@ -41,7 +41,9 @@ def main():
         for nd in nodes:
             i, role = nd["i"], nd["role"]
             cares = "battlefield" in H.ROLE_TABLES[role]
-            fc = H.count_rows(nd, "battlefield", prefix)
+            # ★本地直读(绕查询路由):测「本地真存了多少」。用 count_rows(走 API)会被
+            #  查询路由(4.4.2)转发到持有者、把本地裁剪掩盖成「到处都有」(假泄漏)。
+            fc = H.count_rows_local(nd, "battlefield", prefix)
             d = {m: after[i][m] - before[i][m] for m in PATHS}
             print(f"{i:<6}{role:<8}{str(cares):<12}{fc:<10}"
                   f"{int(d['corro.broadcast.recv.count']):<14}"

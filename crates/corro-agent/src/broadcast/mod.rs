@@ -38,6 +38,7 @@ use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
 use corro_types::{
     actor::{Actor, ActorId},
     agent::Agent,
+    config::BroadcastStrategy,
     broadcast::{
         BroadcastInput, BroadcastV1, Changeset, DispatchRuntime, FocaCmd, FocaInput, UniPayload,
         UniPayloadV1,
@@ -634,7 +635,13 @@ async fn handle_broadcasts(
 
                 let tables = changeset_tables(&bcast);
                 // scope = 这条广播的分组键：恰好 1 张表 → Some(表名)；0 或多表 → None(混合)。
-                let this_scope: Option<String> = if tables.len() == 1 {
+                // 门控:仅在智能策略(scored/scored_reduce/rl,按 interest 过滤)下才按表分组——
+                // random=广播式全量复制基线,保持上游原批处理行为(回归安全,不影响吞吐特性)。
+                let group_by_table = !matches!(
+                    agent.config().gossip.broadcast_strategy,
+                    BroadcastStrategy::Random
+                );
+                let this_scope: Option<String> = if group_by_table && tables.len() == 1 {
                     Some(tables[0].clone())
                 } else {
                     None

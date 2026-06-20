@@ -32,9 +32,16 @@ corrosion 默认**全量复制**(每节点存全部),要降量必须把它改成
 - **推送轴**:广播按表分组(消除混表搭便车)+ 只发关心者 + selector 接缝(留 RL 接入位)。
 - **对账轴**:握手带 interest,`handle_need` **版本级过滤**——版本不碰关心表则发 `Changeset::Empty`
   (复用 crsqlite `crsql_set_db_version` 推进度水位、干净关缺口),**不碰 bookie 收齐判定**(安全)。
+  过滤覆盖**全部 serving 分支**:Full/Partial × (已应用 `crsql_changes` / 缓冲 `__corro_buffered_changes`)。
+  早期只过滤 Full+已应用分支,缓冲窗口/Partial 请求下中转节点会把非关心表原始行直发(并发/大规模/
+  多源 serving 才触发的潜在泄漏);现四分支统一走 `touches_interest`,堵死该缺口。
 
 ### 2.3 实测结论
 - 部分复制达成:各角色节点只本地有任务相关表,非关心表本地为 0,无对账死锁(`verify_phase2.py`)。
+- **★测量纠偏(诚实、重要)**:部分复制后,非关心节点本地无该表,但 API 查询(`/v1/queries`)会经
+  **查询路由(4.4.2)转发到持有者**返回计数——这会把「本地已裁剪」误读成「到处都有」(假泄漏/假 FAIL)。
+  验证本地裁剪必须**直读本节点 sqlite db(绕路由)**:`count_rows_local`。修正测量后 9 节点 `verify_phase2.py`
+  PASS(关心表收齐、非关心表本地 0、gap/needed 不增长)。降量机制一直正确,是测量工具被自身路由欺骗。
 - **全局传输降幅稳定 68~77%**(6~24 节点)、42 节点 58%(`sweep.py` 多规模×重复均值)。
   规模下滑经查为 harness"启动后写 interest"的传播竞态(真实部署启动静态配 interest 无此问题,
   长 settle 验证降幅回升)。**远超 30%。**
@@ -85,11 +92,15 @@ RL 决策的 placement 经 gossip 在容断网络中分发,查询路由也走同
 |---|---|---|
 | 4.4.3 全局传输降 30% | ✅ 稳定 58~77% | `sweep.py` 多规模均值;`verify_phase2.py` 部分复制+无死锁 |
 | 4.4.2 任意节点查任意数据 | ✅ correctness;QPS 压测后续 | `query_routing_test.py` 路由拿回正确结果 |
-| 4.2.3 数据需求模版 + gossip 多跳 + 模型 | ✅ | `node_interest` 模版;gossip 保留;GNN+DRL 模型 |
+| 4.2.3 数据需求模版 + gossip 多跳 + 模型 | ✅ | `node_interest` 模版(节点启动**自写**);gossip 保留;GNN+DRL 模型 |
 | 4.3.3 GNN+DRL 适配度评分函数 | ✅ 核心验证 | 监督省 65% + RL 鲁棒省 69%;3 张证据图 |
 
+**生产侧 interest 写入(本轮收口)**:corrosion 启动时从 `gossip.interest` 配置**自写** `node_interest`
+(`run_root.rs::write_own_interest`),不再依赖外部/harness 写入,且启动即可见(减轻传播竞态)。
+`SKIP_WRITE_INTEREST=1 verify_phase2.py` 验证:全靠 corrosion 自写,部分复制仍 PASS。
+
 **未尽事项(诚实)**:① 1M QPS 压测/缓存;② RL 链路优势的注入延迟端到端验证;
-③ 单事务多表的行级精度(scoped bookie,高风险);④ interest 的生产侧写入/wildcard;⑤ 更大规模(100 节点)。
+③ 单事务多表的行级精度(scoped bookie,高风险);④ interest 的 wildcard/动态变更;⑤ 更大规模(100 节点)。
 
 **方法学**:全程"设计 → Codex 对抗复核 → 实现 → 实测(重复均值)→ 诚实记录(含失败)",
 多处靠 Codex 复核纠偏(payload 混表根因、一进程约束下路线选择、RL 奖励 hacking 防护、稳定化)。

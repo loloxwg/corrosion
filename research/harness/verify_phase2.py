@@ -82,8 +82,10 @@ def main():
             i, role = nd["i"], nd["role"]
             interested = H.ROLE_TABLES[role]
             others = [t for t in H.TABLES if t not in interested]
-            int_counts = {t: H.count_rows(nd, t, prefix) for t in interested}
-            oth_counts = {t: H.count_rows(nd, t, prefix) for t in others}
+            # ★直读本地 db(count_rows_local),绕过查询路由(4.4.2)——否则非关心节点经路由
+            #  从持有者拿回计数,会把「本地已裁剪」误判成「本地有数据」(假 FAIL)。
+            int_counts = {t: H.count_rows_local(nd, t, prefix) for t in interested}
+            oth_counts = {t: H.count_rows_local(nd, t, prefix) for t in others}
 
             # node0 是写入者，本地有全部数据，跳过"非关心缺失"判定
             is_writer = (i == 0)

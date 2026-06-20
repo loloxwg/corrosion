@@ -62,11 +62,16 @@ def build_routing(n, base_gossip):
 
 def write_interest(nodes):
     """各节点自声明 interest：写入复制表 node_interest(本节点 crsql_site_id(), 关心的表)。
-    经正常 exec 写入→走 crsqlite 复制路径→全集群可见；推送端聚合它选目标平台。"""
+    经正常 exec 写入→走 crsqlite 复制路径→全集群可见；推送端聚合它选目标平台。
+    注:corrosion 现已在启动时从 gossip.interest 自写 node_interest(run_root.rs::write_own_interest);
+    这里是冗余兜底(表已 INSERT OR IGNORE 同效)。设 SKIP_WRITE_INTEREST=1 可验证 corrosion 自写独立工作。"""
+    if os.environ.get("SKIP_WRITE_INTEREST"):
+        print("[harness] SKIP_WRITE_INTEREST=1: 不由 harness 写 node_interest,验证 corrosion 启动自写")
+        return
     for nd in nodes:
         for t in ROLE_TABLES[nd["role"]]:
             sh([BIN, "-c", nd["cfg"], "exec",
-                "INSERT INTO node_interest (actor_id, table_name) "
+                "INSERT OR IGNORE INTO node_interest (actor_id, table_name) "
                 f"VALUES (crsql_site_id(), '{t}')"])
 
 
@@ -111,6 +116,7 @@ prometheus.addr = "127.0.0.1:{prom}"
 """)
         nodes.append({"i": i, "role": role_of(i), "cfg": cfg,
                       "api": api, "prom": prom,
+                      "db": os.path.join(WORK, f"node{i}.db"),
                       "log": os.path.join(WORK, f"node{i}.log")})
     return nodes
 
@@ -143,7 +149,21 @@ def wait_active(nodes, timeout=30):
 
 
 def count_rows(nd, table, prefix):
+    """经 API 查询行数。注意:scored_reduce 下本地无该表时会触发**查询路由(4.4.2)**,
+    转发到持有者返回其计数——这测的是「能否查到」,不是「本地是否存了」。
+    验证部分复制(本地裁剪)必须用 count_rows_local 直读本地 db,否则路由会掩盖本地裁剪。"""
     r = sh([BIN, "-c", nd["cfg"], "query",
+            f"SELECT count(*) FROM {table} WHERE id LIKE '{prefix}%'"])
+    try:
+        return int(r.stdout.strip().split("|")[0])
+    except (ValueError, IndexError):
+        return -1
+
+
+def count_rows_local(nd, table, prefix):
+    """直读本节点 sqlite db 文件(WAL 并发读),**绕过查询路由**,测「本地真实存了多少行」。
+    部分复制验证的正确测量:非关心表本地应为 0(即便 API 查询能经路由从持有者拿到)。"""
+    r = sh(["sqlite3", nd["db"],
             f"SELECT count(*) FROM {table} WHERE id LIKE '{prefix}%'"])
     try:
         return int(r.stdout.strip().split("|")[0])

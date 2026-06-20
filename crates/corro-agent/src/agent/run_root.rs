@@ -14,8 +14,9 @@ use crate::{
     transport::Transport,
 };
 
+use crate::api::public::make_broadcastable_changes;
 use corro_types::{
-    agent::{Agent, Bookie},
+    agent::{Agent, Bookie, ChangeError},
     base::CrsqlSeq,
     channel::bounded,
     config::{Config, PerfConfig},
@@ -24,7 +25,7 @@ use corro_types::{
 use futures::FutureExt;
 use spawn::spawn_counted;
 use tokio::task::JoinHandle;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tripwire::Tripwire;
 
 /// Start a new agent with an existing configuration
@@ -112,6 +113,10 @@ async fn run(
     if let Err(e) = execute_schema_from_paths(&agent).await {
         error!("could not execute schema: {e}");
     }
+
+    // 自写 interest:从 gossip.interest 写入复制表 node_interest(4.2.3 数据需求模版的节点自描述)。
+    // 让 interest 配置化、不依赖外部写,且启动即可见(减轻传播竞态)。schema 须含 node_interest 表。
+    write_own_interest(&agent).await;
 
     let mut handles = vec![];
     // Setup client http API
@@ -217,4 +222,42 @@ async fn run(
     handles.push(changes_handle);
 
     Ok((bookie, handles))
+}
+
+/// 启动时把本节点 `gossip.interest` 写入复制表 `node_interest`(走正常本地写路径→复制到全集群)。
+/// 空 interest = 关心全部(全量节点),不写。`node_interest` 表须在 schema 中(否则只 warn,不致命)。
+/// 对接 4.2.3「数据需求模版」的节点自描述;让 interest 配置化、不依赖外部写、启动即可见。
+async fn write_own_interest(agent: &Agent) {
+    let interest = agent.config().gossip.interest.clone();
+    if interest.is_empty() {
+        return;
+    }
+    let to_write = interest.clone();
+    let res = make_broadcastable_changes(agent, None, move |tx| {
+        let mut stmt = tx
+            .prepare_cached(
+                "INSERT OR IGNORE INTO node_interest (actor_id, table_name) \
+                 VALUES (crsql_site_id(), ?)",
+            )
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: None,
+                version: None,
+            })?;
+        for t in &to_write {
+            stmt.execute([t]).map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: None,
+                version: None,
+            })?;
+        }
+        Ok(())
+    })
+    .await;
+    match res {
+        Ok(_) => info!("wrote self-declared interest to node_interest: {interest:?}"),
+        Err(e) => {
+            warn!("could not write node_interest (is the node_interest table in your schema?): {e}")
+        }
+    }
 }
