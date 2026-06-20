@@ -602,7 +602,9 @@ pub(crate) async fn build_query_rows_response(
         let conn = InterruptibleTransaction::new(conn.conn(), timeout, "query");
         trace!(%client_addr, "Preparing statement {}", stmt.query());
 
-        let prepped_res = block_in_place(|| conn.prepare(stmt.query()));
+        // prepare_cached:复用每连接的 prepared statement 缓存,省掉重复 SQL 解析(高 QPS 热路径)。
+        // 同 SQL(尤其参数化查询)命中缓存;变化 SQL 走 rusqlite LRU(默认16)淘汰,有界不爆。
+        let prepped_res = block_in_place(|| conn.prepare_cached(stmt.query()));
 
         let mut prepped = match prepped_res {
             Ok(prepped) => prepped,
