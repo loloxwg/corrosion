@@ -13,7 +13,11 @@ docs/research/
   README.md                   本文件
   active-push-plan.md         主动推送改造方案 + 对照实验设计（§8 = 1b 前提）
   active-push-1b-design.md     1b 详细设计：对账按 interest 过滤（含 §7.5 根因复盘=payload 混表）
-  active-push-cluster-design.md 圈子(cluster)分群实现部分复制——推荐主线，不改 corrosion 内部
+  active-push-technical-report.md  ★技术研究报告(总览,对接 4.2.3/4.3.3/4.4.2/4.4.3)
+  active-push-route-a-design.md    路线A(单进程内 interest 裁剪)实施设计
+  active-push-query-routing-design.md  查询路由(4.4.2)设计
+  active-push-rl-design.md         GNN+DRL(4.3.3)设计
+  active-push-cluster-design.md    圈子方案(因"一进程"约束未采用,存档)
   gossipdb-design.md          教学最小实现的设计文档（原理推导）
 sandbox/gossipdb/             自研 200 行教学原型（HLC/CRDT/SWIM/对账全透明）
                               用于吃透 Corrosion 每块在干嘛，非生产代码
