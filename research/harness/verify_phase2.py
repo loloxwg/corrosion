@@ -90,7 +90,10 @@ def main():
             # node0 是写入者，本地有全部数据，跳过"非关心缺失"判定
             is_writer = (i == 0)
             int_ok = all(c == args.rows for c in int_counts.values())
-            oth_ok = is_writer or all(c == 0 for c in oth_counts.values())
+            # 非关心表须在「已应用业务表」与「buffered 暂存层」**都=0**(后者防收了未 apply 的泄漏)。
+            oth_buf = {t: H.count_buffered_local(nd, t) for t in others}
+            oth_ok = is_writer or (all(c == 0 for c in oth_counts.values())
+                                   and all(c == 0 for c in oth_buf.values()))
             gap_grew = gaps2[i] > gaps1[i]
             need_grew = need2[i] > need1[i] + 1e-6
             if not (int_ok and oth_ok and not gap_grew and not need_grew):

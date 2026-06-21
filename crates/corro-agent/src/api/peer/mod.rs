@@ -488,20 +488,10 @@ fn handle_need(
                 debug!(%actor_id, ?version, %ts, "not empty");
 
                 // interest 版本级过滤(1b)：版本不碰任一关心表 → 当作空版本，计入 empties
-                // 走既有 Changeset::Empty 路径关 gap，跳过整版发送(降量)。node_interest 恒在集合内。
-                if let Some(interest_set) = interest {
-                    let mut tbl_stmt = tx.prepare_cached(
-                        r#"SELECT DISTINCT "table" FROM crsql_changes
-                            WHERE site_id = :actor_id AND db_version = :version"#,
-                    )?;
-                    let touches = tbl_stmt
-                        .query_map(
-                            named_params! { ":actor_id": actor_id, ":version": version },
-                            |r| r.get::<_, String>(0),
-                        )?
-                        .filter_map(Result::ok)
-                        .any(|t| interest_set.contains(&t));
-                    if !touches {
+                // 走既有 Changeset::Empty 路径关 gap，跳过整版发送(降量)。与其余 serving 分支
+                // 统一走 touches_interest(查 crsql_changes∪buffered),消除实现漂移。node_interest 恒豁免。
+                if interest.is_some() {
+                    if !touches_interest(version)? {
                         counter!("corro.sync.interest.filtered.versions").increment(1);
                         empties.insert(version..=version);
                         continue;

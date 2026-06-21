@@ -234,6 +234,29 @@ async fn write_own_interest(agent: &Agent) {
     }
     let to_write = interest.clone();
     let res = make_broadcastable_changes(agent, None, move |tx| {
+        // 启动即权威:先删本 actor 不在当前 interest 的旧行,再 upsert 当前。
+        // 防 db 复用 + interest 变更后残留 —— 尤其旧 "*"(wildcard)行会把本节点误当
+        // 任意表的全量持有者/收件人(查询路由 table='*'、推送 selector 并入所有表),破坏部分复制。
+        let placeholders = std::iter::repeat("?")
+            .take(to_write.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let del_sql = format!(
+            "DELETE FROM node_interest WHERE actor_id = crsql_site_id() \
+             AND table_name NOT IN ({placeholders})"
+        );
+        tx.prepare_cached(&del_sql)
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: None,
+                version: None,
+            })?
+            .execute(rusqlite::params_from_iter(to_write.iter()))
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: None,
+                version: None,
+            })?;
         let mut stmt = tx
             .prepare_cached(
                 "INSERT OR IGNORE INTO node_interest (actor_id, table_name) \

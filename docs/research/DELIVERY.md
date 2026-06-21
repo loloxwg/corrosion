@@ -1,0 +1,71 @@
+# 交付索引 —— 任务驱动智能数据主动推送
+
+研究载体:[superfly/corrosion](https://github.com/superfly/corrosion) 研究 fork,分支 `research/active-push`。
+本文件把**四项考核指标**映射到**证据(脚本/报告/图)与复现命令**。诚实边界见各项末与技术报告。
+
+> 总览先读:[`active-push-technical-report.md`](active-push-technical-report.md)(★ 综述问题/失败教训/最终方案/实测/诚实边界)。
+> 合同原文:[`active-push-plan.md`](active-push-plan.md) §0.1。
+
+## 复现前置
+
+```bash
+cargo build -p corrosion            # 构建 agent 二进制(target/debug/corrosion)
+# harness 依赖:python3、sqlite3、ab(ApacheBench)、matplotlib(仅 sweep 出图)
+```
+
+---
+
+## 4.4.3 全局数据传输降 30%  —— ✅ 稳定 58~77%
+
+| 证据 | 命令 | 验什么 |
+|---|---|---|
+| 降量多规模均值 | `python3 research/harness/sweep.py --sizes 6 12 18 24 --rows 20 --repeats 3` | 总传输降幅(广播式 vs 智能),多规模×重复取均值+误差带 |
+| 部分复制 + 无死锁 | `SKIP_WRITE_INTEREST=1 python3 research/harness/verify_phase2.py --nodes 9` | 关心表本地收齐、非关心表**业务表+buffered 双层都=0**(直读 db 绕路由)、gap/needed 不增长 |
+| 泄漏定位(推送 vs 对账) | `python3 research/harness/debug_leak.py 6` | 非关心节点 battlefield 本地=0,确认两轴都按 interest 过滤 |
+| 多表事务残留边界 | `python3 research/harness/multitable_test.py` | 单事务多表=版本级边界(行级精度未做,诚实) |
+
+**机制**:interest 模型(`node_interest` 复制表)+ 推送按表分组 + 对账 `handle_need` 版本级过滤(四个 serving 分支统一)。
+**诚实**:测量须**直读本地 db(`count_rows_local`)绕开查询路由**,否则路由会把本地裁剪掩盖成"到处都有"(假 FAIL)。
+
+## 4.4.2 任意节点查任意数据 + 1M QPS  —— 查询路由 ✅ correctness;1M=单节点微基准外推(未半实物验证)
+
+| 证据 | 命令 | 验什么 |
+|---|---|---|
+| 查询路由 correctness | `python3 research/harness/query_routing_test.py` | 本地有则本地答、没有则路由到持有者拿回正确结果 |
+| QPS 基准 + 外推 | `python3 research/harness/qps_bench.py --nodes 1` | 单节点本地点查 ≥25K QPS、100 节点外推 2.5M、500Kbps 路由上限 442K |
+
+**论证**(技术报告 §3.1):1M 必须靠本地命中(部分复制让高频查询本地化);500Kbps 跨节点路由 ≈89 QPS/link,
+路由聚合上限 <1M → 本地命中是数学必然。**诚实**:无 100 节点半实物;单机数是下界;聚合 ×100 是外推。
+
+## 4.2.3 数据需求模版 + gossip 多跳 + 智能推送模型  —— ✅
+
+| 证据 | 命令/位置 | 验什么 |
+|---|---|---|
+| 数据需求模版(节点自描述) | `node_interest` 复制表;corrosion 启动从 `gossip.interest` **自写**(`run_root.rs::write_own_interest`) | 每节点自声明关心的表,经 crsqlite 复制到全集群 |
+| interest wildcard | `python3 research/harness/wildcard_test.py` | `interest=["*"]`=全量节点;与精确表名两语义;不破坏共存节点的部分复制 |
+| gossip 多跳 | 保留 corrosion 原生 SWIM + gossip(容链路通断) | interest/部分复制/查询路由叠加其上 |
+| 智能推送模型 | 见 4.3.3 | GNN+DRL 适配度评分 |
+
+## 4.3.3 GNN+DRL 适配度评分函数  —— ✅ 核心验证
+
+| 证据 | 命令/位置 | 验什么 |
+|---|---|---|
+| 训练 + 评估 | `cd research/rl && pip install -r requirements.txt && python3 evaluate.py` | 监督 GNN 省 65%(达 greedy);RL 加方差风险省 rule 69%/greedy 4% |
+| 证据图 | `research/rl/fig_score_heatmap.png` / `fig_variance_aware.png` / `fig_ablation.png` | 评分函数 / RL 避高方差链路 / 归因消融 |
+
+**诚实**:RL 链路感知优势依赖链路异质,localhost 均匀链路显示不出(需注入延迟端到端验证,留后续)。
+
+---
+
+## 文档与工具
+
+- **设计文档**:[1b-design](active-push-1b-design.md)(对账过滤)、[route-a-design](active-push-route-a-design.md)(单进程裁剪)、
+  [query-routing-design](active-push-query-routing-design.md)(4.4.2)、[rl-design](active-push-rl-design.md)(4.3.3)、
+  [cluster-design](active-push-cluster-design.md)(圈子方案,因"一进程"约束未采用,存档)。
+- **harness 基础**:`research/harness/run.py`(mission 拓扑 + 配置生成 + 度量)。
+- **教学原型**:`sandbox/gossipdb/`(200 行 HLC/CRDT/SWIM/对账,吃透 corrosion 用,非生产)。
+
+## 未尽事项(诚实)
+
+① 100 节点半实物真聚合(本期单节点实测 + ×100 外推);② 高并发缓存/连接池调优;
+③ RL 链路优势的注入延迟端到端验证;④ 单事务多表的行级精度(scoped bookie,高风险);⑤ interest 动态变更/历史回填。

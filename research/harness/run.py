@@ -161,10 +161,23 @@ def count_rows(nd, table, prefix):
 
 
 def count_rows_local(nd, table, prefix):
-    """直读本节点 sqlite db 文件(WAL 并发读),**绕过查询路由**,测「本地真实存了多少行」。
-    部分复制验证的正确测量:非关心表本地应为 0(即便 API 查询能经路由从持有者拿到)。"""
+    """直读本节点 sqlite db 文件(WAL 并发读),**绕过查询路由**,测「本地真实存了多少行」(已应用)。
+    部分复制验证的正确测量:非关心表本地应为 0(即便 API 查询能经路由从持有者拿到)。
+    注:只看业务表=已应用层;「收了但未 apply」的泄漏在 buffered 层,须配合 count_buffered_local。"""
     r = sh(["sqlite3", nd["db"],
             f"SELECT count(*) FROM {table} WHERE id LIKE '{prefix}%'"])
+    try:
+        return int(r.stdout.strip().split("|")[0])
+    except (ValueError, IndexError):
+        return -1
+
+
+def count_buffered_local(nd, table):
+    """直读 __corro_buffered_changes(收了但尚未 apply 的暂存层)里某表的行数。
+    部分复制验证须连这层一起查:非关心表若漏到 buffered(即便业务表还=0)也是泄漏。
+    __corro_buffered_changes 是 corrosion 普通表(非 crsql 虚表),sqlite3 可直读。"""
+    r = sh(["sqlite3", nd["db"],
+            f"SELECT count(*) FROM __corro_buffered_changes WHERE \"table\" = '{table}'"])
     try:
         return int(r.stdout.strip().split("|")[0])
     except (ValueError, IndexError):

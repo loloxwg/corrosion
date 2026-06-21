@@ -106,8 +106,8 @@ RL 决策的 placement 经 gossip 在容断网络中分发,查询路由也走同
 
 | 考核项 | 状态 | 关键证据 |
 |---|---|---|
-| 4.4.3 全局传输降 30% | ✅ 稳定 58~77% | `sweep.py` 多规模均值;`verify_phase2.py` 部分复制+无死锁 |
-| 4.4.2 任意节点查 + 1M QPS | ✅ correctness + QPS 实测/外推 | `query_routing_test.py` 路由正确;`qps_bench.py` 单节点≥25K→外推 2.5M,500Kbps 路由上限442K |
+| 4.4.3 全局传输降 30% | ✅ localhost harness 58~77%(待 100 节点半实物复核) | `sweep.py` 多规模重复均值;`verify_phase2.py` 部分复制(业务表+buffered 双层)+无死锁 |
+| 4.4.2 任意节点查 + 1M QPS | 查询路由 ✅ correctness;1M=单节点微基准外推(**未半实物验证**) | `query_routing_test.py` 路由正确;`qps_bench.py` 单节点≥25K→×100 外推 2.5M,500Kbps 路由上限442K |
 | 4.2.3 数据需求模版 + gossip 多跳 + 模型 | ✅ | `node_interest` 模版(节点启动**自写**);gossip 保留;GNN+DRL 模型 |
 | 4.3.3 GNN+DRL 适配度评分函数 | ✅ 核心验证 | 监督省 65% + RL 鲁棒省 69%;3 张证据图 |
 
