@@ -52,8 +52,10 @@ cargo build -p corrosion            # 构建 agent 二进制(target/debug/corros
 |---|---|---|
 | 训练 + 评估 | `cd research/rl && pip install -r requirements.txt && python3 evaluate.py` | 监督 GNN 省 65%(达 greedy);RL 加方差风险省 rule 69%/greedy 4% |
 | 证据图 | `research/rl/fig_score_heatmap.png` / `fig_variance_aware.png` / `fig_ablation.png` | 评分函数 / RL 避高方差链路 / 归因消融 |
+| **端到端 sim-to-real** | `python3 research/harness/rl_e2e_latency.py` | 真 RL 模型选低方差 holder(var 0.11 vs greedy 1.69)→ 真 corrosion 路由查询 P50 **16ms vs 207ms** |
 
-**诚实**:RL 链路感知优势依赖链路异质,localhost 均匀链路显示不出(需注入延迟端到端验证,留后续)。
+**RL 优势分两部分**:① 基数(高写少存→字节)= **已由 4.4.3 降量验证**;② 方差规避(查询密集放稳定 holder→延迟)= `rl_e2e_latency.py` 验证。
+**诚实**:字节量上显示不出②(corrosion anti-entropy/多路径太鲁棒,实测丢包反更省字节),故改测**查询路由延迟**;链路注入用应用层(`transport.rs` `CORRO_LINK_FAULTS`,无 sudo),QUIC 重传级高保真留 dummynet 附录。
 
 ---
 

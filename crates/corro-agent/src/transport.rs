@@ -31,6 +31,7 @@ struct TransportInner {
     conns: RwLock<HashMap<SocketAddr, Arc<Mutex<Option<Connection>>>>>,
     rtt_tx: mpsc::Sender<(SocketAddr, Duration)>,
     path_snapshots: StdMutex<HashMap<SocketAddr, PathSnapshot>>,
+    link_faults: HashMap<SocketAddr, LinkFault>, // 研究专用,见 load_link_faults
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -38,6 +39,49 @@ struct PathSnapshot {
     cwnd: u64,
     congestion_events: u64,
     black_holes_detected: u64,
+}
+
+// ── 研究专用(4.3.3 RL 端到端):应用层 per-peer broadcast 链路故障注入 ──────────────
+// 目的:localhost 链路均匀,显示不出 RL 学到的"避高方差链路"优势。注入 per-peer broadcast
+// 丢包/延迟模拟链路异质 —— 丢 broadcast(send_uni)→ 接收方漏收 → corrosion anti-entropy 补传
+// (真实额外 sync 字节,可测)。**只丢 broadcast**:SWIM(send_datagram)与 sync(open_bi)保持
+// 干净,避免破坏成员收敛与补传机制本身。env CORRO_LINK_FAULTS 未设=空 map=零开销零行为变化。
+#[derive(Debug, Clone, Copy, Default)]
+struct LinkFault {
+    drop_p: f64,
+    delay_ms: u64,
+}
+
+fn load_link_faults() -> HashMap<SocketAddr, LinkFault> {
+    // CORRO_LINK_FAULTS = JSON 字面量或文件路径:{"[::1]:7404":{"drop_p":0.1,"delay_ms":50}}
+    let raw = match std::env::var("CORRO_LINK_FAULTS") {
+        Ok(s) if !s.is_empty() => s,
+        _ => return HashMap::new(),
+    };
+    let json = std::fs::read_to_string(&raw).unwrap_or(raw);
+    let parsed: HashMap<String, serde_json::Value> = match serde_json::from_str(&json) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("CORRO_LINK_FAULTS 解析失败,忽略: {e}");
+            return HashMap::new();
+        }
+    };
+    let mut out = HashMap::new();
+    for (k, v) in parsed {
+        if let Ok(addr) = k.parse::<SocketAddr>() {
+            out.insert(
+                addr,
+                LinkFault {
+                    drop_p: v.get("drop_p").and_then(|x| x.as_f64()).unwrap_or(0.0),
+                    delay_ms: v.get("delay_ms").and_then(|x| x.as_u64()).unwrap_or(0),
+                },
+            );
+        }
+    }
+    if !out.is_empty() {
+        info!("research: 注入 {} 个 peer 的 broadcast 链路故障(CORRO_LINK_FAULTS)", out.len());
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -100,6 +144,7 @@ impl Transport {
             conns: Default::default(),
             rtt_tx,
             path_snapshots: Default::default(),
+            link_faults: load_link_faults(),
         })))
     }
 
@@ -150,6 +195,23 @@ impl Transport {
     #[tracing::instrument(skip(self, data), fields(buf_size = data.len()), level = "debug", err)]
     pub async fn send_uni(&self, addr: SocketAddr, data: Bytes) -> Result<(), TransportError> {
         let len = data.len();
+
+        // 研究专用(4.3.3):per-peer broadcast 链路故障注入。延迟→拖慢链路;丢包→接收方漏收,
+        // 由 corrosion anti-entropy 补传(真实额外字节)。CORRO_LINK_FAULTS 未设时 map 空,零开销。
+        if let Some(f) = self.0.link_faults.get(&addr).copied() {
+            if f.delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(f.delay_ms)).await;
+            }
+            if f.drop_p > 0.0 && rand::random::<f64>() < f.drop_p {
+                counter!(
+                    "corro.research.link.broadcast.dropped",
+                    "traffic" => TrafficClass::Broadcast.as_str()
+                )
+                .increment(1);
+                return Ok(());
+            }
+        }
+
         let conn = self.connect(addr, TrafficClass::Broadcast).await?;
 
         let mut stream = match conn
@@ -198,6 +260,14 @@ impl Transport {
         &self,
         addr: SocketAddr,
     ) -> Result<(SendStream, RecvStream), TransportError> {
+        // 研究专用(4.3.3):对 bi-stream(sync + 查询路由 QueryForward)注入 per-peer 延迟。
+        // 只加 delay 不丢包——丢包会破坏 anti-entropy/查询本身;延迟模拟"坏链路 holder 查询慢"。
+        // 用于证明:数据若放在坏链路 holder,路由查询变慢(placement 决定延迟,RL 避之)。
+        if let Some(f) = self.0.link_faults.get(&addr).copied() {
+            if f.delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(f.delay_ms)).await;
+            }
+        }
         let conn = self.connect(addr, TrafficClass::Sync).await?;
         match conn.open_bi().instrument(debug_span!("quic_open_bi")).await {
             Ok(send_recv) => return Ok(send_recv),

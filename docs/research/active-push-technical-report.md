@@ -100,9 +100,27 @@ placement(谁存/收哪类数据)此前是人工规则。4.3.3 要用 **GNN+DRL 
 - **证据图**:`fig_score_heatmap`(评分函数)/`fig_variance_aware`(RL 避高方差,监督不会)/`fig_ablation`(归因)。
 - **诚实点**:首次随机对称扰动 RL 没赢(无结构性鲁棒空间),改"链路方差"风险模型 + 稳定基线后才显出价值。
 
-### 4.3 sim-to-real 现状(诚实)
-"placement→降传输"基本机制已被 harness 实测验证(§2.3,cluster/sweep)。RL 的**链路/方差感知优势**
-依赖链路异质,**localhost harness 链路均匀显示不出**(需注入延迟仿真才能端到端验证)→ 留后续。
+### 4.3 sim-to-real 端到端验证(已做,与 Codex 联合;含重要诚实校准)
+RL 的优势**分两部分**,各自对应不同度量,分别端到端验证:
+
+- **① placement 基数(高写数据少存 → holder 少 → 字节少)** → **已由 4.4.3 降量端到端验证**
+  (§2.3 的 54~77% 降量本质就是它:少存 = 少推送 + 少对账)。这是 RL/placement 的主优势。
+- **② 链路方差规避(查询密集数据放稳定链路 holder)** → **延迟/可靠性优势**,本次用注入实测验证。
+
+**关键 sim-to-real 校准(诚实、反直觉)**:起初想在真 corrosion 上用**字节量**显示②,实测发现**显示不出**——
+app 层给坏链路注入丢包,corrosion 的 anti-entropy 补传**比逐条 broadcast 更省字节**(实测丢 60% 反而总量 ↓5%),
+且**多路径冗余(broadcast+gossip+对账)绕过单链路故障**(延迟 broadcast,sync 照样秒收敛)。
+即 corrosion 太鲁棒,链路质量不放大 app 字节量。**真实可观测的是查询路由延迟**:查询密集数据只存少数 holder,
+消费者查它要路由过去,holder 在坏链路则慢(无冗余可绕)。
+
+**端到端实测(`research/harness/rl_e2e_latency.py` + `transport.rs` 的 `CORRO_LINK_FAULTS` 应用层注入)**:
+- 段 A(真 RL 模型决策):对查询密集数据 target,RL 选的 holder 链路方差 **0.11** vs greedy **1.69**——RL 选了远更稳的 holder。
+- 段 B(真 corrosion):把 target 放在 RL 选的稳定 holder(注入 13ms)vs greedy 选的高方差 holder(注入 203ms),
+  消费者路由查询 **P50 16ms vs 207ms** → **RL 的方差感知 placement 使真实查询延迟低 13×**。
+- **结论**:RL 主优势(基数→字节)已由 4.4.3 验证;次优势(方差→查询延迟)由本实验端到端验证。两者都落地。
+
+**诚实边界**:① 链路方差→延迟为线性映射(合成),真实战场链路更复杂;② 单 holder 简化;
+③ 应用层注入延迟≠QUIC 子包级重传(更高保真需 macOS dummynet,需 sudo,留作附录);④ 12 平台/小规模。
 
 ## 5. gossip 多跳路由(4.2.3)
 保留 corrosion 原生 SWIM + gossip 多跳传播(容链路通断);interest/部分复制叠加其上。
@@ -115,7 +133,7 @@ RL 决策的 placement 经 gossip 在容断网络中分发,查询路由也走同
 | 4.4.3 全局传输降 30% | ✅ localhost 54~77%(42 节点 54%,外推 100 节点≈44%,均>30%;待半实物复核) | `sweep.py` 多规模重复均值+误差带;`verify_phase2.py` 部分复制(业务表+buffered 双层)+无死锁 |
 | 4.4.2 任意节点查 + 1M QPS | 查询路由 ✅ correctness;1M=单节点微基准外推(**未半实物验证**) | `query_routing_test.py` 路由正确;`qps_bench.py` 单节点≥25K→×100 外推 2.5M,500Kbps 路由上限442K |
 | 4.2.3 数据需求模版 + gossip 多跳 + 模型 | ✅ | `node_interest` 模版(节点启动**自写**);gossip 保留;GNN+DRL 模型 |
-| 4.3.3 GNN+DRL 适配度评分函数 | ✅ 核心验证 | 监督省 65% + RL 鲁棒省 69%;3 张证据图 |
+| 4.3.3 GNN+DRL 适配度评分函数 | ✅ 核心验证 + 端到端 | 监督省 65% + RL 鲁棒省 69%;3 张证据图;`rl_e2e_latency.py` RL placement 查询延迟 16 vs 207ms |
 
 **生产侧 interest 写入(本轮收口)**:corrosion 启动时从 `gossip.interest` 配置**自写** `node_interest`
 (`run_root.rs::write_own_interest`),不再依赖外部/harness 写入,且启动即可见(减轻传播竞态)。
@@ -128,7 +146,8 @@ RL 决策的 placement 经 gossip 在容断网络中分发,查询路由也走同
 共存的 jam 节点仍只有 target(部分复制不被破坏)、jam 经路由从 `*` 持有者取回 flight。
 
 **未尽事项(诚实)**:① 100 节点半实物真聚合(本期单节点实测 + ×100 外推);② 高并发缓存/连接池调优;
-③ RL 链路优势的注入延迟端到端验证;④ 单事务多表的行级精度(scoped bookie,高风险);⑤ interest 动态变更/历史回填。
+③ RL 链路优势的 **dummynet/QUIC 重传**高保真复核(本期已用应用层延迟注入端到端验证查询延迟优势,§4.3);
+④ 单事务多表的行级精度(scoped bookie,高风险);⑤ interest 动态变更/历史回填。
 
 **方法学**:全程"设计 → Codex 对抗复核 → 实现 → 实测(重复均值)→ 诚实记录(含失败)",
 多处靠 Codex 复核纠偏(payload 混表根因、一进程约束下路线选择、RL 奖励 hacking 防护、稳定化、1M QPS 可达性骨架)。
