@@ -42,10 +42,11 @@ struct PathSnapshot {
 }
 
 // ── 研究专用(4.3.3 RL 端到端):应用层 per-peer broadcast 链路故障注入 ──────────────
-// 目的:localhost 链路均匀,显示不出 RL 学到的"避高方差链路"优势。注入 per-peer broadcast
-// 丢包/延迟模拟链路异质 —— 丢 broadcast(send_uni)→ 接收方漏收 → corrosion anti-entropy 补传
-// (真实额外 sync 字节,可测)。**只丢 broadcast**:SWIM(send_datagram)与 sync(open_bi)保持
-// 干净,避免破坏成员收敛与补传机制本身。env CORRO_LINK_FAULTS 未设=空 map=零开销零行为变化。
+// 目的:localhost 链路均匀,显示不出 RL 学到的"避高方差链路"优势。注入 per-peer
+// 丢包/延迟模拟链路异质。drop 只作用 broadcast(send_uni)→ 接收方漏收 → anti-entropy 补传。
+// delay 作用 send_uni + open_bi(查询路由/对账),并叠加进上报 RTT → ring 看得见故障,
+// resolve_table_holder 按 ring 选最优 holder 时能避开高延迟节点(RL placement 端到端可证)。
+// env CORRO_LINK_FAULTS 未设=空 map=零开销零行为变化。
 #[derive(Debug, Clone, Copy, Default)]
 struct LinkFault {
     drop_p: f64,
@@ -364,7 +365,13 @@ impl Transport {
 
         if let Some(conn) = lock.as_ref() {
             if test_conn(conn) {
-                if let Err(e) = self.0.rtt_tx.try_send((addr, conn.rtt())) {
+                // 研究专用:注入的链路延迟叠加进上报 RTT,使 ring(RTT 分桶)看得见故障,
+                // resolve_table_holder 按 ring 选最优 holder 时才能避开高延迟节点。默认空 map 无影响。
+                let rtt = conn.rtt()
+                    + Duration::from_millis(
+                        self.0.link_faults.get(&addr).map(|f| f.delay_ms).unwrap_or(0),
+                    );
+                if let Err(e) = self.0.rtt_tx.try_send((addr, rtt)) {
                     debug!("could not send RTT for connection through sender: {e}");
                 }
                 return Ok(conn.clone());

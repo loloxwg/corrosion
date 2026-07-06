@@ -62,7 +62,12 @@ cargo build -p corrosion            # 构建 agent 二进制(target/debug/corros
 - **字节**:RL vs 同副本预算随机砍(random_cut)推送字节 **↓-0.1%**(RL 甚至略差)→ 降量为 **cardinality 主导(副本数)**,非 RL 读写权衡(当前单表写入/无丢包限速条件下)。
 - **延迟**:`resolve_table_holder`(`api/public/mod.rs:420`,SQL 无 ORDER BY)按顺序选**首个** holder,**不认方差**。合成对照证死:target 放 {快+慢} 两 holder,对调快慢角色后 `{both}` 恒命中同一节点(node1)的延迟 → RL 挑的低方差非 critical holder 路由永远选不到;target 的 critical holder 硬约束必含且可能高方差。
 - **附带发现**:`api/public/mod.rs:809` **空 interest = 隐式全量节点**(本地答不路由 + `interest_for_sync`=None 全量对账),无法表达"只查不存"的 route-only 节点;稀疏 placement 让需要者空手即触发。harness 用哨兵表(`__route_only__` 恒空)workaround 证明并绕过(路由 P50 1ms→179ms 恢复)。
-- **结论**:RL 达标合同(placement 驱动真推送 ↓94.8%),但集群级智能被两架构点吸收(推送只认副本数、路由不认方差)。**解锁需改 `resolve_table_holder` 为方差/负载感知**(路由层一处,不碰 RL/selector);RL 单 holder 受控优势(13×)仍以 `rl_e2e_latency.py` 为准。合同 4.3.3 落点为**攻关报告级评分函数**,不要求 RL 进生产推送路径,故此负结果不影响达标。
+- **结论**:RL 达标合同(placement 驱动真推送 ↓94.8%),但集群级智能被两架构点吸收(推送只认副本数、路由不认方差)。合同 4.3.3 落点为**攻关报告级评分函数**,不要求 RL 进生产推送路径,故此负结果不影响达标。
+
+**★resolve 方差感知改造 + RL 价值双向证伪(2026-07-06,生产改动)**:把 `resolve_table_holder`(`api/public/mod.rs`)从"选 SQL 顺序首个 holder"改为"选 **RTT(ring)最优** holder"(`min_by_key(ring)`,未知 RTT 排最后)——这是独立于 RL 的**正确生产改进**(异构网络路由到最近 holder,查询延迟更低)。配套研究开关:`transport.rs` 把 `CORRO_LINK_FAULTS` 注入延迟叠加进上报 RTT,使 ring 看得见合成故障(默认空 map 无影响)。
+- **改造生效证据**(合成对调探针,`rl_placement_e2e.py::probe_resolve_behavior`):target 放 {快 20ms + 慢 220ms} 两 holder,**对调快慢角色后 `{both}` 恒命中「快」holder(组A/组B 都 23ms)**——改前恒命中固定 node1(与快慢无关),改后恒命中快的(与节点顺序无关),同一实验结论翻转 → resolve 确实按 RTT 选最优。
+- **★RL 价值被吸收(Codex #2d 预言证实)**:改后 RL vs random_cut 全集群查询延迟仍**平手(都 1ms)**。根因:两策略**共享 target 的 critical holder(硬约束必含)**,resolve 选其中 RTT 最优的那个 → 选到同一个好 holder,RL 精挑的非 critical holder 无用武之地。**RL 价值两头堵:改前被路由挡(选不到 RL 的好 holder)、改后被路由吸收(路由自己找到好 holder)。** RL 干净显价值只剩"唯一 holder 无路由选择"的受控场景(`rl_e2e_latency.py` 13×)。
+- **回归**:`query_routing_test.py` 正确性 PASS;`cargo test -p corro-agent --lib` 43 passed(`test_lagging_subscribers` 已知 flaky,隔离通过)。resolve 改进值得留(生产查询延迟收益),RL 集群解锁作诚实负结果记录。
 
 ---
 

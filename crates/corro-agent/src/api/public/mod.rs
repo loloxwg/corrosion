@@ -453,19 +453,26 @@ async fn resolve_table_holder(agent: &Agent, table: &str) -> Option<SocketAddr> 
         let self_actor_id = agent.actor_id();
         let cluster_id = agent.cluster_id();
         let members = agent.members().read();
-        actor_ids.into_iter().find_map(|actor_id| {
-            if actor_id == self_actor_id {
-                return None;
-            }
-
-            members.states.get(&actor_id).and_then(|state| {
-                if state.cluster_id == cluster_id && state.addr != agent.gossip_addr() {
-                    Some(state.addr)
-                } else {
-                    None
+        // 选 RTT(ring)最优的 holder,而非首个(此前 find_map 取 SQL 顺序第一个,不认链路质量,
+        // 使 RL 的低方差 placement 路由永远选不到)。ring=RTT 分桶(0=最好);未知 RTT(None)按
+        // 最差处理排最后,给它被探测的机会但不优先。这样 placement 把数据放在低延迟可达的 holder
+        // 才有意义(RL 集群价值的解锁点)。
+        actor_ids
+            .into_iter()
+            .filter_map(|actor_id| {
+                if actor_id == self_actor_id {
+                    return None;
                 }
+                members.states.get(&actor_id).and_then(|state| {
+                    if state.cluster_id == cluster_id && state.addr != agent.gossip_addr() {
+                        Some((state.ring.unwrap_or(u8::MAX), state.addr))
+                    } else {
+                        None
+                    }
+                })
             })
-        })
+            .min_by_key(|(ring, _)| *ring)
+            .map(|(_, addr)| addr)
     })
 }
 

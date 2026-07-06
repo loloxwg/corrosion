@@ -269,7 +269,8 @@ def probe_resolve_behavior(n, settle, fast_ms=20, slow_ms=220, kq=12):
         imap = {i: [ROUTE_MARKER] for i in range(n)}
         for h in holders:
             imap[h] = ["target"]
-        imap[0] = ["target"]  # 种子写 target,自己也持有(不影响 consumer 路由)
+        # 从 holder 写 target(不让 node0 当无延迟持有者搭便车,否则 resolve 总选 0 延迟的它)。
+        writer = holders[0]
         nodes = write_configs_custom(n, "scored_reduce", imap)
         procs = H.start(nodes)
         try:
@@ -278,7 +279,7 @@ def probe_resolve_behavior(n, settle, fast_ms=20, slow_ms=220, kq=12):
             time.sleep(settle)
             prefix = f"p{int(time.time())}_"
             for j in range(15):
-                H.sh([H.BIN, "-c", nodes[0]["cfg"], "exec", "--param", f"{prefix}{j}",
+                H.sh([H.BIN, "-c", nodes[writer]["cfg"], "exec", "--param", f"{prefix}{j}",
                       "--param", f"v{j}", "INSERT INTO target (id,data) VALUES (?,?)"])
             # 等 holder 本地就绪(直读 sqlite)
             dl = time.time() + 40
@@ -323,13 +324,18 @@ def probe_resolve_behavior(n, settle, fast_ms=20, slow_ms=220, kq=12):
     print(f"  组B(对调):node{FAST}={slow_ms}ms(慢) node{SLOW}={fast_ms}ms(快)")
     b_both = one([FAST, SLOW], fb, f"  B {{node{FAST}+node{SLOW}}}")
     if a_both is not None and b_both is not None:
-        picks_node1 = a_both < (fast_ms + slow_ms) / 2 and b_both > (fast_ms + slow_ms) / 2
+        mid = (fast_ms + slow_ms) / 2
+        picks_first = a_both < mid and b_both > mid   # 两组都命中 node1(A=快/B=慢)→ 选首个
+        picks_best = a_both < mid and b_both < mid    # 两组都命中快的 → 按 RTT 选最优
         print(f"  判定:组A {{both}}={a_both:.0f}ms(node{FAST}=快), 组B {{both}}={b_both:.0f}ms(node{FAST}=慢)")
-        if picks_node1:
-            print(f"  → 两组 {{both}} 都命中 node{FAST} 的延迟(与快慢无关)"
-                  f"→ ★resolve 按 SQL 顺序选首个 holder,**不认方差**(延迟层根因证死)")
+        if picks_best:
+            print("  → ✅两组 {both} 都命中「快」holder(与节点顺序无关)"
+                  "→ resolve 按 RTT(ring)选最优 holder = **RL placement 集群价值解锁**")
+        elif picks_first:
+            print(f"  → 两组 {{both}} 都命中 node{FAST}(与快慢无关)"
+                  "→ resolve 按 SQL 顺序选首个,不认方差(旧行为)")
         else:
-            print("  → 未稳定命中同一节点,需更多轮/换拓扑再验")
+            print("  → 未稳定,需更多轮/换拓扑再验")
     return a_both, b_both
 
 
