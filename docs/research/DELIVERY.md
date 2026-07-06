@@ -53,9 +53,16 @@ cargo build -p corrosion            # 构建 agent 二进制(target/debug/corros
 | 训练 + 评估 | `cd research/rl && pip install -r requirements.txt && python3 evaluate.py` | 监督 GNN 省 65%(达 greedy);RL 加方差风险省 rule 69%/greedy 4% |
 | 证据图 | `research/rl/fig_score_heatmap.png` / `fig_variance_aware.png` / `fig_ablation.png` | 评分函数 / RL 避高方差链路 / 归因消融 |
 | **端到端 sim-to-real** | `python3 research/harness/rl_e2e_latency.py` | 真 RL 模型选低方差 holder(var 0.11 vs greedy 1.69)→ 真 corrosion 路由查询 P50 **16ms vs 207ms** |
+| **集群 placement 真跑** | `python3 research/harness/rl_placement_e2e.py --nodes 9 --repeats 3` | RL placement 驱动真 selector 推送:达标 ↓94.8% vs 广播;含 random_cut 同副本预算基线 + resolve 合成对照 |
 
 **RL 优势分两部分**:① 基数(高写少存→字节)= **已由 4.4.3 降量验证**;② 方差规避(查询密集放稳定 holder→延迟)= `rl_e2e_latency.py` 验证。
 **诚实**:字节量上显示不出②(corrosion anti-entropy/多路径太鲁棒,实测丢包反更省字节),故改测**查询路由延迟**;链路注入用应用层(`transport.rs` `CORRO_LINK_FAULTS`,无 sudo),QUIC 重传级高保真留 dummynet 附录。
+
+**★集群级归因(2026-07-06,`rl_placement_e2e.py` + Codex 对抗复核,诚实负结果)**:把 RL placement 接进真集群(RL 算 placement→每节点 interest→selector 推送,RL 不进热路径),逐层证死 RL 的"智能"在**当前 corrosion 集群**里显不出来:
+- **字节**:RL vs 同副本预算随机砍(random_cut)推送字节 **↓-0.1%**(RL 甚至略差)→ 降量为 **cardinality 主导(副本数)**,非 RL 读写权衡(当前单表写入/无丢包限速条件下)。
+- **延迟**:`resolve_table_holder`(`api/public/mod.rs:420`,SQL 无 ORDER BY)按顺序选**首个** holder,**不认方差**。合成对照证死:target 放 {快+慢} 两 holder,对调快慢角色后 `{both}` 恒命中同一节点(node1)的延迟 → RL 挑的低方差非 critical holder 路由永远选不到;target 的 critical holder 硬约束必含且可能高方差。
+- **附带发现**:`api/public/mod.rs:809` **空 interest = 隐式全量节点**(本地答不路由 + `interest_for_sync`=None 全量对账),无法表达"只查不存"的 route-only 节点;稀疏 placement 让需要者空手即触发。harness 用哨兵表(`__route_only__` 恒空)workaround 证明并绕过(路由 P50 1ms→179ms 恢复)。
+- **结论**:RL 达标合同(placement 驱动真推送 ↓94.8%),但集群级智能被两架构点吸收(推送只认副本数、路由不认方差)。**解锁需改 `resolve_table_holder` 为方差/负载感知**(路由层一处,不碰 RL/selector);RL 单 holder 受控优势(13×)仍以 `rl_e2e_latency.py` 为准。合同 4.3.3 落点为**攻关报告级评分函数**,不要求 RL 进生产推送路径,故此负结果不影响达标。
 
 ---
 
