@@ -53,6 +53,28 @@ pub struct Rtt {
     pub buf: CircularBuffer<20, u64>,
 }
 
+impl Rtt {
+    /// 最近 RTT 样本(ms)的方差(ms²)。<2 样本返回 None。
+    /// 研究/RL 瞬态选路用:同均值链路里偏好低方差(稳定)的做广播目标。
+    pub fn variance(&self) -> Option<f64> {
+        let n = self.buf.len();
+        if n < 2 {
+            return None;
+        }
+        let mean = self.buf.iter().copied().sum::<u64>() as f64 / n as f64;
+        let var = self
+            .buf
+            .iter()
+            .map(|&x| {
+                let d = x as f64 - mean;
+                d * d
+            })
+            .sum::<f64>()
+            / n as f64;
+        Some(var)
+    }
+}
+
 #[derive(Default)]
 pub struct Members {
     pub member_id: Option<MemberId>,

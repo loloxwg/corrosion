@@ -756,10 +756,8 @@ async fn handle_broadcasts(
 
             // ring0(RTT 最近一圈)候选 → 交给 selector 决定 flood 给谁：
             // random 传 k=全部候选，等价原"全发 ring0";scored_reduce 只发关心该数据的 + 覆盖配额。
-            let ring0_addrs: Vec<SocketAddr> = {
-                let members = agent.members().read();
-                members.ring0(agent.cluster_id()).collect()
-            };
+            let members = agent.members().read();
+            let ring0_addrs: Vec<SocketAddr> = members.ring0(agent.cluster_id()).collect();
             // 排除集 = 全部 ring0：无论是否被快速推送，都不再走远端 selector 路径，
             // 任务无关近邻由 anti-entropy 兜底——这正是"不走快速推送"的减量来源。
             for &addr in &ring0_addrs {
@@ -770,8 +768,11 @@ async fn handle_broadcasts(
                 .map(|&addr| Candidate {
                     addr,
                     ring: Some(0),
+                    // Rl 用:ring0 内也有链路稳定度差异,带上方差供方差感知选目标。
+                    rtt_var: members.rtts.get(&addr).and_then(|r| r.variance()),
                 })
                 .collect();
+            drop(members);
             let targets = select_broadcast_targets(
                 broadcast_strategy,
                 &candidates,
@@ -870,9 +871,8 @@ async fn handle_broadcasts(
                 let broadcast_to = {
                     // 先筛出合法候选 peer（排除自己/异 cluster/ring0(本地广播时)/已发过的），
                     // 再交给可替换的选择器决定发给谁——这是主动推送研究的接缝。
-                    let candidates: Vec<_> = agent
-                        .members()
-                        .read()
+                    let members = agent.members().read();
+                    let candidates: Vec<_> = members
                         .states
                         .iter()
                         .filter_map(|(member_id, state)| {
@@ -888,10 +888,14 @@ async fn handle_broadcasts(
                             {
                                 None
                             } else {
-                                // 带上链路质量信号(ring)供打分式选择器使用
+                                // 带上链路质量信号(ring + RTT 方差)供打分/Rl 选择器使用
                                 Some(Candidate {
                                     addr: state.addr,
                                     ring: state.ring,
+                                    rtt_var: members
+                                        .rtts
+                                        .get(&state.addr)
+                                        .and_then(|r| r.variance()),
                                 })
                             }
                         })

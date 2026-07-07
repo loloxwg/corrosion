@@ -69,6 +69,12 @@ cargo build -p corrosion            # 构建 agent 二进制(target/debug/corros
 - **★RL 价值被吸收(Codex #2d 预言证实)**:改后 RL vs random_cut 全集群查询延迟仍**平手(都 1ms)**。根因:两策略**共享 target 的 critical holder(硬约束必含)**,resolve 选其中 RTT 最优的那个 → 选到同一个好 holder,RL 精挑的非 critical holder 无用武之地。**RL 价值两头堵:改前被路由挡(选不到 RL 的好 holder)、改后被路由吸收(路由自己找到好 holder)。** RL 干净显价值只剩"唯一 holder 无路由选择"的受控场景(`rl_e2e_latency.py` 13×)。
 - **回归**:`query_routing_test.py` 正确性 PASS;`cargo test -p corro-agent --lib` 43 passed(`test_lagging_subscribers` 已知 flaky,隔离通过)。resolve 改进值得留(生产查询延迟收益),RL 集群解锁作诚实负结果记录。
 
+**★RL 归位:瞬态选路层(BroadcastStrategy::Rl)+ 动态 placement 正确性 bug(2026-07-06)**:厘清 RL 的**安全落点**——不是动态改 placement(谁长期持有),而是在 interest 圈定的合法集内优化"这条广播发给谁/扇出/路径"(瞬态层,推错自愈不丢数据)。
+- **动态 placement 的正确性 bug(实测坐实,`dynamic_interest_hole.py`)**:节点先不关心某表→对账把该表版本发 `Changeset::Empty`→标 `KnownDbVersion::Cleared` 关 gap;之后动态"重新关心"→`generate_sync` 不再请求(Cleared 与"真有数据"不区分,bookie.rs:211)→**永久数据洞**。实测:NodeR 重新关心 target 后本地仍 0/15,对照 NodeS 15/15(数据在集群有源)。更危险:NodeR 以 holder 身份对查询本地答 0(假 holder)。Codex 复核确认真 bug + 推送(node_interest 动态)/对账(gossip.interest 静态)读**两套 interest 状态**。**故 RL 不可动态改 placement**;静态 interest(所有考核用法)安全。
+- **RL 归位实现(selector.rs)**:`BroadcastStrategy::Rl` 从占位回退→真实现:合法集先由 `interest_pool`(同 scored_reduce 的正确性/降量边界)圈定,**RL 仅在集内**用方差感知打分(`rl_score`=基础分−方差惩罚,`VARIANCE_WEIGHT=0.8`,偏好低 RTT 方差=稳定链路做广播目标,不稳链路留 anti-entropy 兜底)。方差信号来自 `members.rtts` 最近 20 样本(`Rtt::variance()`)。**安全:只在合法集内重排,不改 placement/不碰 durability,推错自愈。** 权重可离线 RL 学习/蒸馏,现手设为 RL 学到的方向(sim-to-real 已证方差感知降查询延迟)。
+- **回归**:selector 单测 11 passed(新增 rl_prefers_low_variance / rl_stays_within_interest_set / rl_falls_back_to_full_without_interest);`cargo test -p corro-agent --lib` 46 passed(flaky 隔离通过)。
+- **对合同**:RL 决策"这次推给哪平台/走哪路径"=瞬态选路(安全落点),"谁长期持有"=interest 规则(静态,durability 层)。RL 是攻关报告级策略层验证,不碰正确性。
+
 ---
 
 ## 文档与工具
