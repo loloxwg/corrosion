@@ -122,6 +122,26 @@ app 层给坏链路注入丢包,corrosion 的 anti-entropy 补传**比逐条 bro
 **诚实边界**:① 链路方差→延迟为线性映射(合成),真实战场链路更复杂;② 单 holder 简化;
 ③ 应用层注入延迟≠QUIC 子包级重传(更高保真需 macOS dummynet,需 sudo,留作附录);④ 12 平台/小规模。
 
+### 4.4 集群级归因:RL 价值的「三处吸收」与安全归位(★核心诚实结论)
+
+§4.3 的 13× 是在**受控单 holder**场景取得的。把 RL 接进**真集群**逐层验证后(`rl_placement_e2e.py` + Codex 对抗复核),得到一个反直觉但扎实的结论:**RL 的"智能"超出平凡基线的部分,在当前 corrosion 集群里处处被现成机制吸收**——三个维度同构:
+
+| 维度 | RL 想加的价值 | 被谁吸收 | 实测 |
+|---|---|---|---|
+| **字节** | placement 少存高写数据 | **cardinality(副本数)** | RL vs 同副本预算随机砍(random_cut)推送字节 **↓0.0%**(完全相同):同副本数→推送字节数学上相同,与"砍哪张表"无关 |
+| **查询延迟** | 把数据放稳定 holder | **resolve(改后按 RTT 选最优)** | 改 `resolve_table_holder` 选 RTT 最优 holder 后,RL vs random_cut 延迟平手:两者共享 critical holder,resolve 选其中好的→同一 holder,RL 的非 critical 精选选不到 |
+| **广播选路** | 发给稳定链路 peer | **ring(RTT 分桶已排序)** | `BroadcastStrategy::Rl` 方差感知选目标,e2e 仅 ↓5%:高方差⟹高均值 RTT⟹高 ring⟹已被 ring0-flood 降优先级,纯方差信号空间极小 |
+
+**为什么三处同构**:corrosion 在**副本管理、RTT 路由、链路分桶**这些维度本身已经做得扎实(cardinality 决定字节、resolve/ring 决定链路偏好),RL 试图注入的"把数据/流量放对地方"的智能,恰好落在这些已被现成机制覆盖的维度上 → 被吸收。**这不是 RL 失败,是 corrosion 设计扎实**;RL 干净显价值只在"绕开这些机制"的受控场景(§4.3 单 holder 13×)。
+
+**副产品(独立真改进)**:为解锁 RL 而做的 `resolve_table_holder` 从「选 SQL 首个」→「选 RTT 最优 holder」,本身是独立于 RL 的正确生产改进(异构网络查询路由到最近 holder);合成对调探针证明其生效(target 放 {快+慢},对调角色后 `{both}` 恒命中快 holder)。
+
+**RL 的安全归位(关键设计决策)**:RL 有两种可能落点——
+- **动态 placement(谁长期持有,durability 层)**:❌ **不安全**。实测(`dynamic_interest_hole.py`)坐实一个正确性 bug:节点动态"重新关心"某表时,对账早先把该表版本发 `Changeset::Empty`→标 `Cleared` 关 gap→**永不重取**→本地永久缺历史数据,却以 holder 身份对外服务不完整结果(NodeR 重新关心后 0/15,对照 15/15)。Codex 复核确认真 bug + 推送/对账读两套 interest 状态。
+- **瞬态选路(这条广播发给谁/扇出/路径)**:✅ **安全**。合法范围由 interest 规则圈定,RL 只在集内优化,**推错自愈**(anti-entropy 兜底,不改 placement/不碰 durability)。已实现为 `BroadcastStrategy::Rl`(方差感知,单测+e2e)。
+
+**故 RL 归位在瞬态层**(符合合同 4.3.3"目标平台/路径"的措辞,"谁长期持有"=interest 规则,静态安全)。这也界定了未尽工程:若未来要动态 placement,须先补"重新关心→scoped 回填 + handoff 纪律 + 推送/对账 interest 口径统一"的安全协议(见 §6 未尽事项)。
+
 ## 5. gossip 多跳路由(4.2.3)
 保留 corrosion 原生 SWIM + gossip 多跳传播(容链路通断);interest/部分复制叠加其上。
 RL 决策的 placement 经 gossip 在容断网络中分发,查询路由也走同一 QUIC 通道。
@@ -133,7 +153,7 @@ RL 决策的 placement 经 gossip 在容断网络中分发,查询路由也走同
 | 4.4.3 全局传输降 30% | ✅ localhost 54~77%(42 节点 54%,外推 100 节点≈44%,均>30%;待半实物复核) | `sweep.py` 多规模重复均值+误差带;`verify_phase2.py` 部分复制(业务表+buffered 双层)+无死锁 |
 | 4.4.2 任意节点查 + 1M QPS | 查询路由 ✅ correctness;1M=单节点微基准外推(**未半实物验证**) | `query_routing_test.py` 路由正确;`qps_bench.py` 单节点≥25K→×100 外推 2.5M,500Kbps 路由上限442K |
 | 4.2.3 数据需求模版 + gossip 多跳 + 模型 | ✅ | `node_interest` 模版(节点启动**自写**);gossip 保留;GNN+DRL 模型 |
-| 4.3.3 GNN+DRL 适配度评分函数 | ✅ 核心验证 + 端到端 | 监督省 65% + RL 鲁棒省 69%;3 张证据图;`rl_e2e_latency.py` RL placement 查询延迟 16 vs 207ms |
+| 4.3.3 GNN+DRL 适配度评分函数 | ✅ 核心验证 + 端到端;集群级归因诚实(§4.4) | 监督省 65% + RL 鲁棒省 69%;3 张证据图;`rl_e2e_latency.py` 受控 16 vs 207ms(13×);`rl_placement_e2e.py` 集群逐层证「三处吸收」;RL 安全归位瞬态选路 `BroadcastStrategy::Rl` |
 
 **生产侧 interest 写入(本轮收口)**:corrosion 启动时从 `gossip.interest` 配置**自写** `node_interest`
 (`run_root.rs::write_own_interest`),不再依赖外部/harness 写入,且启动即可见(减轻传播竞态)。
@@ -145,9 +165,14 @@ RL 决策的 placement 经 gossip 在容断网络中分发,查询路由也走同
 (`resolve_table_holder` 匹配 `table=? OR '*'`)。`wildcard_test.py` 实测:`*` 节点本地收全 3 表、
 共存的 jam 节点仍只有 target(部分复制不被破坏)、jam 经路由从 `*` 持有者取回 flight。
 
+**动态 interest 安全边界(本轮收口,★正确性)**:实测坐实(`dynamic_interest_hole.py` + Codex 复核)一个**动态 placement 的正确性 bug**——
+- **机制**:节点先不关心表 T 时,对账把 T 的版本发 `Changeset::Empty` → `process_empty_version` 标 `KnownDbVersion::Cleared` → 从 `__corro_bookkeeping_gaps` 删该 gap;`generate_sync` 的 need 计算里 `Cleared` 与「真有完整数据」**不区分**(`bookie.rs` `contains_version`)→ 节点动态"重新关心"T 后**永不重取**那些版本 → 本地永久缺 T 的历史数据,却以 holder 身份对查询本地答不完整结果(实测 NodeR 重新关心后 0/15,对照 NodeS 15/15)。另 Codex 发现推送侧读运行时 `node_interest`、对账侧读静态 `gossip.interest` 配置,**两套 interest 状态分裂**。
+- **收口结论**:**静态 interest(本项目所有考核/实验用法)完全安全**——CRDT 值不分叉、不删本地数据、部分复制正确。bug **仅在动态变更 interest 时触发**(见 §4.4:这也是 RL 归位瞬态层、不做动态 placement 的原因之一)。
+- **若未来需动态 placement**,最小安全协议:① 重新关心 T 时,把 T 相关的已 `Cleared` 版本重新插回 gaps 触发 scoped 回填(需给 `Changeset::Empty` 带表集合,或保守全段重开);② 失去 interest 的 handoff 纪律(≥min_replicas 当前 holder 已持有再摘除路由);③ 推送/对账 interest 口径统一(都读 `node_interest`);④ 回填需集群有全量/wildcard holder 留完整历史作源。列为独立立项。
+
 **未尽事项(诚实)**:① 100 节点半实物真聚合(本期单节点实测 + ×100 外推);② 高并发缓存/连接池调优;
 ③ RL 链路优势的 **dummynet/QUIC 重传**高保真复核(本期已用应用层延迟注入端到端验证查询延迟优势,§4.3);
-④ 单事务多表的行级精度(scoped bookie,高风险);⑤ interest 动态变更/历史回填。
+④ 单事务多表的行级精度(scoped bookie,高风险);⑤ **动态 interest/placement 安全协议**(上段:静态安全,动态有已坐实数据洞 bug,须补 scoped 回填+handoff+口径统一,独立立项)。
 
 **方法学**:全程"设计 → Codex 对抗复核 → 实现 → 实测(重复均值)→ 诚实记录(含失败)",
 多处靠 Codex 复核纠偏(payload 混表根因、一进程约束下路线选择、RL 奖励 hacking 防护、稳定化、1M QPS 可达性骨架)。
