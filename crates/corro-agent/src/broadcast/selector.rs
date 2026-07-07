@@ -45,7 +45,7 @@ pub fn select_broadcast_targets(
     k: usize,
     rng: &mut StdRng,
 ) -> Vec<SocketAddr> {
-    match strategy {
+    let targets = match strategy {
         BroadcastStrategy::Random => random_targets(candidates, k, rng),
         BroadcastStrategy::Scored => {
             scored_targets(candidates, tables, interest_routing, k, rng)
@@ -56,7 +56,42 @@ pub fn select_broadcast_targets(
         BroadcastStrategy::Rl => {
             rl_targets(candidates, tables, interest_routing, k, rng)
         }
+    };
+    record_target_variance(strategy, candidates, &targets);
+    targets
+}
+
+/// 研究度量:所选广播目标的平均 RTT 方差(按策略标签)。
+/// 验证 Rl 相比 scored 偏好低方差(稳定)链路——rl 的目标方差均值应更低。
+/// 无 rtt_var 样本(未注入/无历史)时不计,零开销。
+fn record_target_variance(
+    strategy: BroadcastStrategy,
+    candidates: &[Candidate],
+    targets: &[SocketAddr],
+) {
+    let (mut sum, mut n) = (0.0f64, 0u64);
+    for addr in targets {
+        if let Some(v) = candidates
+            .iter()
+            .find(|c| &c.addr == addr)
+            .and_then(|c| c.rtt_var)
+        {
+            sum += v;
+            n += 1;
+        }
     }
+    if n == 0 {
+        return;
+    }
+    let name = match strategy {
+        BroadcastStrategy::Random => "random",
+        BroadcastStrategy::Scored => "scored",
+        BroadcastStrategy::ScoredReduce => "scored_reduce",
+        BroadcastStrategy::Rl => "rl",
+    };
+    counter!("corro.broadcast.target.rttvar_milli", "strategy" => name)
+        .increment((sum * 1000.0) as u64);
+    counter!("corro.broadcast.target.count", "strategy" => name).increment(n);
 }
 
 /// 基线：纯随机选 K（用 IteratorRandom，与改造前实现一致）。

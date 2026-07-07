@@ -51,6 +51,9 @@ struct PathSnapshot {
 struct LinkFault {
     drop_p: f64,
     delay_ms: u64,
+    // 研究:上报 RTT 加 0..=jitter_ms 随机抖动 → 产生 RTT 方差(非仅抬均值)。
+    // 让 Rl 的方差感知选路有可测信号:高 jitter=不稳链路,Rl 应避开做广播目标。
+    jitter_ms: u64,
 }
 
 fn load_link_faults() -> HashMap<SocketAddr, LinkFault> {
@@ -75,6 +78,7 @@ fn load_link_faults() -> HashMap<SocketAddr, LinkFault> {
                 LinkFault {
                     drop_p: v.get("drop_p").and_then(|x| x.as_f64()).unwrap_or(0.0),
                     delay_ms: v.get("delay_ms").and_then(|x| x.as_u64()).unwrap_or(0),
+                    jitter_ms: v.get("jitter_ms").and_then(|x| x.as_u64()).unwrap_or(0),
                 },
             );
         }
@@ -368,9 +372,19 @@ impl Transport {
                 // 研究专用:注入的链路延迟叠加进上报 RTT,使 ring(RTT 分桶)看得见故障,
                 // resolve_table_holder 按 ring 选最优 holder 时才能避开高延迟节点。默认空 map 无影响。
                 let rtt = conn.rtt()
-                    + Duration::from_millis(
-                        self.0.link_faults.get(&addr).map(|f| f.delay_ms).unwrap_or(0),
-                    );
+                    + self
+                        .0
+                        .link_faults
+                        .get(&addr)
+                        .map(|f| {
+                            let jitter = if f.jitter_ms > 0 {
+                                rand::random::<u64>() % (f.jitter_ms + 1)
+                            } else {
+                                0
+                            };
+                            Duration::from_millis(f.delay_ms + jitter)
+                        })
+                        .unwrap_or_default();
                 if let Err(e) = self.0.rtt_tx.try_send((addr, rtt)) {
                     debug!("could not send RTT for connection through sender: {e}");
                 }
