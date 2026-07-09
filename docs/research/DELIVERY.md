@@ -81,7 +81,9 @@ cargo build -p corrosion            # 构建 agent 二进制(target/debug/corros
 - **活模型接线**:agent 启动加载权重(`GossipConfig.graphrl` 配置:weights_path + 数据属性 + 角色映射 + critical);InterestRefresh tick(3s)周期跑推理,用当前态势(interest=needer图 + members实时链路,归一化到训练尺度)算 `score(表,平台)` 适配度评分表;selector 的 `BroadcastStrategy::Rl` 用 GNN 分给推送目标打分(`GNN_AFFINITY_WEIGHT=3.0` 压过链路项)。
 - **端到端演示**(`research/harness/graphrl_live_demo.py`,6 节点侦查/打击/干扰):实测 **6/6 节点加载 GNN + 6/6 跑推理 + 现算决策推送目标**(日志 `graphrl 决策: target 最优推送目标 → node (适配度 1.00)`),随态势 3s 刷新。**每个无人机节点里跑着 GNN,实时决策数据推送目标 = 评审要的活智能体。**
 - **安全**:活模型只在 interest 合法集内选推送目标(瞬态层),不改 placement/不碰 durability,推错自愈。空态势/加载失败优雅退化(Rl 回退启发式)。
-- **诚实边界**:① 评分尺度为名义映射(RTT→训练尺度),真校准待半实物真流量;② 模型输出仍塌缩到 critical(target 1.0/其余≈0,与 §4.4 一致);③ 价值薄(三处吸收),但**机制活、可演、安全、合同对口**(4.3.3"智能决策推送目标平台/路径")。回归:selector+graphrl 单测 14 passed;lib 47 passed(flaky 隔离通过)。
+- **★真效果实测(`research/harness/graphrl_effect.py`,正确归因 3 臂)**:scored / scored_reduce / rl+GNN 对照(注入 jitter,6 节点 3 轮均值)。**① 减量贡献(scored→scored_reduce)↓75.5%=部分复制,非 GNN;② GNN 隔离效果(scored_reduce→rl+GNN)总传输 +4.3%(略费)、收敛 -1.6%,均在噪声内(<10%)= 实质为 0。** 即系统大头降量来自 interest 减量,GNN 自身加不出可测增益——三处吸收结论的定量确认。避免了"rl vs scored ↓71%"的归因陷阱(那 71% 是减量非 GNN)。
+- **诚实边界**:① 评分尺度为名义映射(RTT→训练尺度),真校准待半实物真流量;② 模型输出仍塌缩到 critical(target 1.0/其余≈0,与 §4.4 一致);③ **GNN 隔离系统效果≈0(实测)**;但**机制活、可演、安全、合同对口**(4.3.3"智能决策推送目标平台/路径")。给评审:活模型能演(活着+决策),诚实说当前不让系统更省/更快,真增益待半实物校准。回归:selector+graphrl 单测 14 passed;lib 47 passed(flaky 隔离通过)。
+- **GNN 与 RL 关系**(答辩要点,见 `active-push-dataflow-sequence.md §7`):GNN=模型架构(运行时 agent 里活着跑前向推理);RL=训练方法(离线一次,监督预训练+REINFORCE 微调定权重,运行时不跑)。部署里活着的是 GNN 推理;在线 RL(运行时学)需真 reward=半实物,列后续。
 
 ---
 
