@@ -47,6 +47,7 @@ use corro_types::{
     sqlite::unnest_param,
 };
 
+mod graphrl;
 mod selector;
 use selector::{select_broadcast_targets, Candidate};
 
@@ -104,6 +105,81 @@ async fn load_interest_routing(agent: &Agent) -> HashMap<String, Vec<SocketAddr>
         }
         map
     })
+}
+
+/// 加载内嵌 GNN 权重(4.3.3 活模型)。未配 graphrl / 读或解析失败 → None(Rl 回退启发式)。
+fn load_graphrl_model(agent: &Agent) -> Option<graphrl::GraphRl> {
+    let cfg = agent.config().gossip.graphrl.clone()?;
+    let raw = match std::fs::read_to_string(&cfg.weights_path) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("graphrl: 读权重失败 {}: {e}", cfg.weights_path);
+            return None;
+        }
+    };
+    let v: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("graphrl: 解析权重 JSON 失败: {e}");
+            return None;
+        }
+    };
+    match graphrl::GraphRl::from_weights_json(&v["weights"]) {
+        Ok(m) => {
+            info!("graphrl: 已加载内嵌 GNN 权重 {}", cfg.weights_path);
+            Some(m)
+        }
+        Err(e) => {
+            warn!("graphrl: {e}");
+            None
+        }
+    }
+}
+
+/// 用当前态势跑 GNN 推理 → 适配度评分表 score(表,平台)。
+/// 链路特征从 members RTT 取,归一化到训练尺度(link_cost∈[0.5,2.5]、link_var∈[0,2]),
+/// 否则 ms 级 RTT 分布外会让输出失真(诚实:归一化为名义映射,真校准待半实物)。
+fn compute_affinity(
+    agent: &Agent,
+    model: &graphrl::GraphRl,
+    interest_routing: &HashMap<String, Vec<SocketAddr>>,
+) -> HashMap<(String, SocketAddr), f32> {
+    let cfg = match &agent.config().gossip.graphrl {
+        Some(c) => c.clone(),
+        None => return HashMap::new(),
+    };
+    let members = agent.members().read();
+    let link_of = |addr: &SocketAddr| -> graphrl::LinkInfo {
+        let (mut mean_ms, mut var_ms) = (0.0f32, 0.0f32);
+        if let Some(rtt) = members.rtts.get(addr) {
+            if !rtt.buf.is_empty() {
+                mean_ms = rtt.buf.iter().copied().sum::<u64>() as f32 / rtt.buf.len() as f32;
+            }
+            if let Some(v) = rtt.variance() {
+                var_ms = v as f32;
+            }
+        }
+        // 归一化到训练尺度(名义映射):RTT 0~200ms → link_cost 0.5~2.5;方差 → 0~2。
+        graphrl::LinkInfo {
+            link_cost: 0.5 + 2.0 * (mean_ms / 200.0).min(1.0),
+            link_var: (var_ms / 5000.0).min(2.0),
+        }
+    };
+    model.score_table(&cfg, interest_routing, link_of)
+}
+
+/// 演示可见:日志打印每张表 GNN 打分最高的平台(活模型的推送目标决策)。
+fn log_affinity_summary(affinity: &HashMap<(String, SocketAddr), f32>) {
+    let mut best: HashMap<&str, (SocketAddr, f32)> = HashMap::new();
+    for ((table, addr), &s) in affinity {
+        let e = best.entry(table.as_str()).or_insert((*addr, s));
+        if s > e.1 {
+            *e = (*addr, s);
+        }
+    }
+    for (table, (addr, s)) in best {
+        info!("graphrl 决策: {table} 最优推送目标 → {addr} (适配度 {s:.2})");
+    }
 }
 
 use crate::{agent::util::log_at_pow_10, transport::Transport};
@@ -562,6 +638,16 @@ async fn handle_broadcasts(
         interest_routing = agent.config().gossip.interest_routing.clone();
     }
 
+    // 内嵌 GNN(4.3.3 活模型):启动加载权重;周期(InterestRefresh tick)跑推理算适配度评分表
+    // score(表,平台),供 Rl 策略给推送目标打分。未配/加载失败=None,Rl 回退手设启发式。
+    let graphrl_model = load_graphrl_model(&agent);
+    let mut affinity: HashMap<(String, SocketAddr), f32> = HashMap::new();
+    if let Some(m) = &graphrl_model {
+        affinity = compute_affinity(&agent, m, &interest_routing);
+        info!("graphrl: 初次推理,评分表 {} 项", affinity.len());
+        log_affinity_summary(&affinity);
+    }
+
     loop {
         let branch = tokio::select! {
             biased;
@@ -738,6 +824,13 @@ async fn handle_broadcasts(
                 } else {
                     refreshed
                 };
+                // 活模型:随态势(interest/成员/链路)周期重跑 GNN 推理,刷新适配度评分表。
+                if let Some(m) = &graphrl_model {
+                    affinity = compute_affinity(&agent, m, &interest_routing);
+                    if !affinity.is_empty() {
+                        log_affinity_summary(&affinity);
+                    }
+                }
             }
         }
 
@@ -778,6 +871,7 @@ async fn handle_broadcasts(
                 &candidates,
                 &tables,
                 &interest_routing,
+                &affinity,
                 candidates.len(),
                 &mut rng,
             );
@@ -909,6 +1003,7 @@ async fn handle_broadcasts(
                         &candidates,
                         &pending.tables,
                         &interest_routing,
+                        &affinity,
                         k,
                         &mut rng,
                     )

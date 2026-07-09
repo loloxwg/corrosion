@@ -2526,6 +2526,7 @@ mod tests {
             broadcast_strategy: Default::default(),
             interest_routing: Default::default(),
             interest: Default::default(),
+            graphrl: None,
         };
 
         let server = gossip_server_endpoint(&gossip_config).await?;

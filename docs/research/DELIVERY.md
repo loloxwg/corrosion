@@ -76,6 +76,13 @@ cargo build -p corrosion            # 构建 agent 二进制(target/debug/corros
 - **端到端实测**(`rl_selector_e2e.py`,8 节点全关心 flight,注入 jitter 产 RTT 方差):埋点 `corro.broadcast.target.rttvar_milli`(所选目标平均方差,按策略)。scored 961 vs **rl 914 ms²(↓5%)**,方向对但边际薄。**★真根因(与查询侧 resolve 吸收同构)**:corrosion 的 RTT-ring 机制已吃掉大部分链路信号——注入 jitter 同时抬高均值 RTT→不稳 peer 落 ring4-5 非 ring0,ring0-flood 总发低 RTT peer→高方差⟹高均值⟹高 ring⟹已被现有机制降优先级;Rl 的"纯方差"信号(同均值不同方差)在 ring0 桶空间极小。机制present(方向对+单测证逻辑),价值被 ring 吸收。
 - **对合同**:RL 决策"这次推给哪平台/走哪路径"=瞬态选路(安全落点),"谁长期持有"=interest 规则(静态,durability 层)。RL 是攻关报告级策略层验证,不碰正确性。诚实:Rl 瞬态价值薄(被 ring 吸收),但安全+机制可证。
 
+**★内嵌 GNN 活模型(2026-07-09):训练好的深度图强化学习模型在真 corrosion 里活着决策推送目标。** 为评审"看得见的智能",把 GNN 从离线 Python 产物做成 agent 里的**活组件**:
+- **权重导出→Rust 手写前向→数值对齐**:`research/rl/export_weights.py` 导出 GNN 权重+参考态势为 JSON;`crates/corro-agent/src/broadcast/graphrl.rs` 手写前向(matmul+relu+二部图消息传递,无 torch/ONNX);单测 `parity_matches_python` 保证 Rust 前向 == PyTorch(误差<1e-3)。
+- **活模型接线**:agent 启动加载权重(`GossipConfig.graphrl` 配置:weights_path + 数据属性 + 角色映射 + critical);InterestRefresh tick(3s)周期跑推理,用当前态势(interest=needer图 + members实时链路,归一化到训练尺度)算 `score(表,平台)` 适配度评分表;selector 的 `BroadcastStrategy::Rl` 用 GNN 分给推送目标打分(`GNN_AFFINITY_WEIGHT=3.0` 压过链路项)。
+- **端到端演示**(`research/harness/graphrl_live_demo.py`,6 节点侦查/打击/干扰):实测 **6/6 节点加载 GNN + 6/6 跑推理 + 现算决策推送目标**(日志 `graphrl 决策: target 最优推送目标 → node (适配度 1.00)`),随态势 3s 刷新。**每个无人机节点里跑着 GNN,实时决策数据推送目标 = 评审要的活智能体。**
+- **安全**:活模型只在 interest 合法集内选推送目标(瞬态层),不改 placement/不碰 durability,推错自愈。空态势/加载失败优雅退化(Rl 回退启发式)。
+- **诚实边界**:① 评分尺度为名义映射(RTT→训练尺度),真校准待半实物真流量;② 模型输出仍塌缩到 critical(target 1.0/其余≈0,与 §4.4 一致);③ 价值薄(三处吸收),但**机制活、可演、安全、合同对口**(4.3.3"智能决策推送目标平台/路径")。回归:selector+graphrl 单测 14 passed;lib 47 passed(flaky 隔离通过)。
+
 ---
 
 ## 文档与工具

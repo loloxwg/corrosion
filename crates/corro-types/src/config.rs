@@ -246,6 +246,41 @@ pub struct GossipConfig {
     /// 空 = 关心全部表（= corrosion 现状全量复制行为，opt-in 关闭态）。
     #[serde(default)]
     pub interest: Vec<String>,
+    /// 内嵌 GNN(4.3.3 活模型)配置。设置=在 agent 里加载训练好的权重、周期跑推理算
+    /// 适配度评分 score(表,平台)驱动 selector 推送目标(仅 broadcast_strategy=rl 时生效)。
+    /// 空=不启用(Rl 回退手设方差启发式)。
+    #[serde(default)]
+    pub graphrl: Option<GraphRlConfig>,
+}
+
+/// 内嵌 GNN 配置(任务模版级静态:权重路径 + 数据属性 + 角色映射 + critical)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphRlConfig {
+    /// 训练好的 GNN 权重 JSON 路径(`research/rl/export_weights.py` 导出)。
+    pub weights_path: String,
+    /// 每张表的属性(全局,任务模版):写量/查询量,喂 GNN 数据特征。
+    #[serde(default)]
+    pub tables: Vec<GraphRlTable>,
+    /// 角色→关心的表(有序,顺序须与训练 ROLES 一致:recon/strike/jam)。
+    /// 用于从 peer 的 interest 反推其角色(平台 one-hot 特征)。
+    #[serde(default)]
+    pub roles: Vec<GraphRlRole>,
+    /// critical(硬 SLA)表:其需要者视为 critical。MVP 简化;真实由战术规则定。
+    #[serde(default)]
+    pub critical_tables: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphRlTable {
+    pub name: String,
+    pub write_vol: f32,
+    pub query_vol: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphRlRole {
+    pub name: String,
+    pub tables: Vec<String>,
 }
 
 /// 广播传播的选 peer 策略。主动推送研究的总开关。
@@ -576,6 +611,7 @@ impl ConfigBuilder {
                 broadcast_strategy: BroadcastStrategy::default(),
                 interest_routing: Default::default(),
                 interest: Default::default(),
+                graphrl: None,
             },
             perf: self.perf.unwrap_or_default(),
             admin: AdminConfig {

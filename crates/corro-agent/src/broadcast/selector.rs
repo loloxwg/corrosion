@@ -32,6 +32,7 @@ const JITTER_WEIGHT: f64 = 0.25; // 探索抖动：避免总固定打同几个 p
 const RELEVANCE_WEIGHT: f64 = 2.0; // 数据相关度：关心该数据的 peer 强加分(压过链路项)
 const COVERAGE_QUOTA: usize = 0; // 减量变体：除关心者外额外保留的覆盖名额(0=严格部分副本,容断靠 sync 兜底)
 const VARIANCE_WEIGHT: f64 = 0.8; // Rl：链路方差惩罚权重(避不稳链路,RL 学到的核心信号)
+const GNN_AFFINITY_WEIGHT: f64 = 3.0; // Rl：GNN 适配度分权重(活模型主信号,压过链路项)
 
 /// 从候选 peer 中选出最多 k 个作为本次广播目标。
 ///
@@ -42,6 +43,7 @@ pub fn select_broadcast_targets(
     candidates: &[Candidate],
     tables: &[String],
     interest_routing: &HashMap<String, Vec<SocketAddr>>,
+    affinity: &HashMap<(String, SocketAddr), f32>,
     k: usize,
     rng: &mut StdRng,
 ) -> Vec<SocketAddr> {
@@ -54,7 +56,7 @@ pub fn select_broadcast_targets(
             scored_reduce_targets(candidates, tables, interest_routing, k, rng)
         }
         BroadcastStrategy::Rl => {
-            rl_targets(candidates, tables, interest_routing, k, rng)
+            rl_targets(candidates, tables, interest_routing, affinity, k, rng)
         }
     };
     record_target_variance(strategy, candidates, &targets);
@@ -141,13 +143,14 @@ fn rl_targets(
     candidates: &[Candidate],
     tables: &[String],
     interest_routing: &HashMap<String, Vec<SocketAddr>>,
+    affinity: &HashMap<(String, SocketAddr), f32>,
     k: usize,
     rng: &mut StdRng,
 ) -> Vec<SocketAddr> {
     let interested = interested_set(tables, interest_routing);
     match interest_pool(candidates, tables, interest_routing) {
-        Some(pool) => rl_scored_targets(&pool, &interested, k, rng),
-        None => rl_scored_targets(candidates, &interested, k, rng),
+        Some(pool) => rl_scored_targets(&pool, &interested, tables, affinity, k, rng),
+        None => rl_scored_targets(candidates, &interested, tables, affinity, k, rng),
     }
 }
 
@@ -185,31 +188,52 @@ fn interest_pool(
     )
 }
 
-/// Rl 打分式：在给定(已由 interest 圈定的)合法集内，按方差感知价值取 Top-K。
+/// Rl 打分式：在给定(已由 interest 圈定的)合法集内，按 GNN 适配度 + 链路取 Top-K。
 fn rl_scored_targets(
     candidates: &[Candidate],
     interested: &HashSet<SocketAddr>,
+    tables: &[String],
+    affinity: &HashMap<(String, SocketAddr), f32>,
     k: usize,
     rng: &mut StdRng,
 ) -> Vec<SocketAddr> {
     let mut scored: Vec<(f64, SocketAddr)> = candidates
         .iter()
-        .map(|c| (rl_score(c, interested, rng), c.addr))
+        .map(|c| (rl_score(c, interested, tables, affinity, rng), c.addr))
         .collect();
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
     scored.into_iter().take(k).map(|(_, addr)| addr).collect()
 }
 
-/// Rl 单候选价值 = 打分式基础分(相关度+链路均值+抖动) − 方差惩罚。
-/// 方差归一化 v/(1+v)∈[0,1)，越不稳扣越多 → 同均值链路里偏好稳定的做广播目标。
-/// 这是 RL 学到的核心信号(sim-to-real 已证方差感知降查询延迟)蒸馏进瞬态选路。
-fn rl_score(c: &Candidate, interested: &HashSet<SocketAddr>, rng: &mut StdRng) -> f64 {
-    let base = score(c, interested, rng);
+/// Rl 单候选价值 = 【GNN 适配度分(活模型)】 + 链路均值 − 方差惩罚 + 抖动。
+/// GNN 分:该候选对本次 mutation 涉及表的最大适配度 score(表,平台)∈[0,1](来自内嵌 GNN 推理)。
+/// affinity 为空(未配模型/加载失败)→ 退回纯启发式(链路 − 方差),向后兼容。
+/// 这就是"训练好的深度图强化学习模型在真系统里决策推送目标"(4.3.3 活模型)。
+fn rl_score(
+    c: &Candidate,
+    interested: &HashSet<SocketAddr>,
+    tables: &[String],
+    affinity: &HashMap<(String, SocketAddr), f32>,
+    rng: &mut StdRng,
+) -> f64 {
+    // 该候选对本次涉及表的 GNN 适配度(取最大);无表命中或无模型 → 0(退回启发式)。
+    let gnn = tables
+        .iter()
+        .filter_map(|t| affinity.get(&(t.clone(), c.addr)))
+        .fold(0.0f32, |m, &s| m.max(s)) as f64;
+    let relevance = if interested.contains(&c.addr) {
+        RELEVANCE_WEIGHT
+    } else {
+        0.0
+    };
+    let ring = c.ring.map(|r| r as f64).unwrap_or(UNKNOWN_RING);
+    let link = 1.0 / (1.0 + ring);
     let var_penalty = c
         .rtt_var
         .map(|v| VARIANCE_WEIGHT * (v / (1.0 + v)))
         .unwrap_or(0.0);
-    base - var_penalty
+    let jitter = rng.gen::<f64>() * JITTER_WEIGHT;
+    GNN_AFFINITY_WEIGHT * gnn + relevance + link - var_penalty + jitter
 }
 
 /// 打分式：链路质量 + 数据相关度 + 探索抖动，取 Top-K。
@@ -269,6 +293,10 @@ mod tests {
     }
 
     fn no_interest() -> HashMap<String, Vec<SocketAddr>> {
+        HashMap::new()
+    }
+
+    fn no_affinity() -> HashMap<(String, SocketAddr), f32> {
         HashMap::new()
     }
 
@@ -403,6 +431,7 @@ mod tests {
                 &candidates,
                 &["todos".to_string()],
                 &routing,
+                &no_affinity(),
                 1,
                 &mut rng,
             );
@@ -424,6 +453,7 @@ mod tests {
             &candidates,
             &["flight".to_string()],
             &routing,
+            &no_affinity(),
             100,
             &mut rng,
         );
@@ -440,6 +470,7 @@ mod tests {
             &candidates,
             &[],
             &no_interest(),
+            &no_affinity(),
             100,
             &mut rng,
         );
