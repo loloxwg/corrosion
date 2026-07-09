@@ -142,9 +142,39 @@ app 层给坏链路注入丢包,corrosion 的 anti-entropy 补传**比逐条 bro
 
 **故 RL 归位在瞬态层**(符合合同 4.3.3"目标平台/路径"的措辞,"谁长期持有"=interest 规则,静态安全)。这也界定了未尽工程:若未来要动态 placement,须先补"重新关心→scoped 回填 + handoff 纪律 + 推送/对账 interest 口径统一"的安全协议(见 §6 未尽事项)。
 
-## 5. gossip 多跳路由(4.2.3)
-保留 corrosion 原生 SWIM + gossip 多跳传播(容链路通断);interest/部分复制叠加其上。
-RL 决策的 placement 经 gossip 在容断网络中分发,查询路由也走同一 QUIC 通道。
+## 5. 不确定链路通断下的多跳路由(4.2.3,已实验验证)
+
+**机制论证**:本方案的多跳路由 = 两条互补路径,均保留 corrosion 原生机制、interest 过滤叠加其上:
+- **快路径 = rebroadcast 疫情式多跳**:每个收到广播的节点按 `max_transmissions` 递减再转发,
+  转发同样经 selector 按 interest 过滤 → 多跳扩散被限制在关心者子图内。单条链路断,数据经
+  其他关心者中继绕行,跳数自适应(无需显式路由表)。
+- **兜底 = anti-entropy sync**:周期随机对账版本区间(按 interest 版本级过滤),快路径整体
+  失效(如接收方所有入向广播链路断)时保证最终收敛。
+- **控制面(SWIM/foca)独立于数据面**:成员协议走 `send_datagram`,数据广播走 `send_uni`,
+  数据链路断不等于节点失联——成员/RTT 信息仍在,选路信号不丢。
+
+**实验**(`research/harness/multihop_test.py`,应用层链路故障注入 `CORRO_LINK_FAULTS`,
+只切广播数据面;6 节点全关心 flight,writer=node0,needer=node5,写 20 行,needer 直读本地 db 计收齐):
+
+| 场景 | 注入 | sync 间隔 | 结果 |
+|---|---|---|---|
+| 对照(直连可用) | 无 | 拉长 60~120s | 0.4s 收齐,丢弃计数 0 |
+| **A:直连断→多跳快路径** | writer→needer drop_p=1.0 | 拉长 60~120s(**隔离对账**) | **0.4s 收齐**(丢弃 26 次=直连真在切)——sync 被隔离,数据必经中继 rebroadcast **≥2 跳**到达,**绕行代价≈0** |
+| **B:快路径全断→sync 兜底** | 全部发送方→needer drop_p=1.0 | 默认 | **1.5s 收齐**(丢弃 52 次)——广播颗粒无存,anti-entropy 补齐,最终一致 |
+
+9 节点复跑结论一致(对照 0.2s / A 0.4s 绕行 +0.2s / B 3.3s),非单次运气。
+
+**实验暴露并修复的真问题(控制面鸡生蛋)**:interest 声明表 `node_interest` 自身的广播曾被
+interest 过滤——没有节点「声明关心 node_interest」→ 合法集为空 → 声明广播零目标,传播完全
+依赖 sync 兜底(默认间隔短未暴露;间隔拉长到 60s 时 interest 图分钟级不完整)。对账侧早有恒
+豁免(`interest_for_sync` 恒加入 `node_interest`),推送侧缺失。**修复**:selector `interest_pool`
+对触及控制面表的广播返回不过滤(全网扩散),与对账侧口径对齐(`selector.rs::CONTROL_TABLE`,
+单测 `control_table_broadcast_bypasses_interest_filter`)。教训:元数据(谁关心什么)必须比
+数据(被关心的内容)有更强的传播保证。
+
+**诚实边界**:应用层注入(丢弃发生在 QUIC 之上,非真实网络丢包/重传行为);localhost 拓扑
+RTT 均匀,真实异构网络多跳绕行代价不会是 0;debug 构建 sync 默认间隔短(1~2s),场景 B 的
+兜底时延随 `min/max_sync_backoff` 配置伸缩;半实物 100 节点通断验证在里程碑 2。
 
 ## 6. 总体结论与交付
 
@@ -152,7 +182,7 @@ RL 决策的 placement 经 gossip 在容断网络中分发,查询路由也走同
 |---|---|---|
 | 4.4.3 全局传输降 30% | ✅ localhost 54~77%(42 节点 54%,外推 100 节点≈44%,均>30%;待半实物复核) | `sweep.py` 多规模重复均值+误差带;`verify_phase2.py` 部分复制(业务表+buffered 双层)+无死锁 |
 | 4.4.2 任意节点查 + 1M QPS | 查询路由 ✅ correctness;1M=单节点微基准外推(**未半实物验证**) | `query_routing_test.py` 路由正确;`qps_bench.py` 单节点≥25K→×100 外推 2.5M,500Kbps 路由上限442K |
-| 4.2.3 数据需求模版 + gossip 多跳 + 模型 | ✅ | `node_interest` 模版(节点启动**自写**);gossip 保留;GNN+DRL 模型 |
+| 4.2.3 数据需求模版 + gossip 多跳 + 模型 | ✅(多跳已实验验证,§5) | `node_interest` 模版(节点启动**自写**);`multihop_test.py` 直连断→中继多跳 0.4s 收齐 / 快路径全断→sync 兜底;GNN+DRL 模型 |
 | 4.3.3 GNN+DRL 适配度评分函数 | ✅ 核心验证 + 端到端;集群级归因诚实(§4.4) | 监督省 65% + RL 鲁棒省 69%;3 张证据图;`rl_e2e_latency.py` 受控 16 vs 207ms(13×);`rl_placement_e2e.py` 集群逐层证「三处吸收」;RL 安全归位瞬态选路 `BroadcastStrategy::Rl` |
 
 **生产侧 interest 写入(本轮收口)**:corrosion 启动时从 `gossip.interest` 配置**自写** `node_interest`

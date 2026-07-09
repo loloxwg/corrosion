@@ -154,14 +154,24 @@ fn rl_targets(
     }
 }
 
+/// 控制面表:interest 声明自身(`node_interest`)的广播必须全网可达。
+/// 否则鸡生蛋——没人「声明关心 node_interest」,按 interest 过滤会把声明本身滤成零目标,
+/// 传播只能靠 sync 兜底(慢,间隔拉长时可达分钟级)。与对账侧豁免(peer/mod.rs interest_for_sync
+/// 恒加入 node_interest)对齐。多跳实验(multihop_test.py)把 sync 拉长到 60s 时暴露此问题。
+const CONTROL_TABLE: &str = "node_interest";
+
 /// interest 合法集：关心者 + COVERAGE_QUOTA 覆盖名额。
-/// None = 无 interest 信号(关闭态) → 调用方退化为全打分(不减量，保活性)。
+/// None = 无 interest 信号(关闭态)或控制面广播 → 调用方退化为全打分(不减量，保活性)。
 /// scored_reduce 与 rl 共用此正确性/降量边界，只在打分函数上分化。
 fn interest_pool(
     candidates: &[Candidate],
     tables: &[String],
     interest_routing: &HashMap<String, Vec<SocketAddr>>,
 ) -> Option<Vec<Candidate>> {
+    // 触及控制面表(含混合批)→ 不过滤,全网扩散(宁多发控制面小表,不可让声明失联)。
+    if tables.iter().any(|t| t == CONTROL_TABLE) {
+        return None;
+    }
     let interested = interested_set(tables, interest_routing);
     if interested.is_empty() {
         // ① 完全没配 interest(关闭态) → 退化为打分式全发(基线行为)。
@@ -395,6 +405,26 @@ mod tests {
             &mut rng,
         );
         assert_eq!(picked, vec![interested.addr], "应只发关心者，非关心者全排除");
+    }
+
+    #[test]
+    fn control_table_broadcast_bypasses_interest_filter() {
+        // node_interest(控制面)广播:即便 interest 已配置且没人"关心 node_interest",
+        // 也必须全网可达——否则声明自身被 interest 过滤,传播只剩 sync 兜底。
+        let a = cand(9000, Some(1));
+        let b = cand(9001, Some(1));
+        let candidates = vec![a, b];
+        let mut routing = HashMap::new();
+        routing.insert("flight".to_string(), vec![a.addr]); // interest 已启用,但只关心 flight
+        let mut rng = StdRng::seed_from_u64(9);
+        let picked = scored_reduce_targets(
+            &candidates,
+            &[CONTROL_TABLE.to_string()],
+            &routing,
+            100,
+            &mut rng,
+        );
+        assert_eq!(picked.len(), 2, "控制面表广播不得被 interest 过滤,应全发");
     }
 
     #[test]
