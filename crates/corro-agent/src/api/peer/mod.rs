@@ -2527,6 +2527,7 @@ mod tests {
             interest_routing: Default::default(),
             interest: Default::default(),
             graphrl: None,
+            critical_tables: Default::default(),
         };
 
         let server = gossip_server_endpoint(&gossip_config).await?;

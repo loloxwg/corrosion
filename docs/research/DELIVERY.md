@@ -55,6 +55,7 @@ cargo build -p corrosion            # 构建 agent 二进制(target/debug/corros
 | 证据图 | `research/rl/fig_score_heatmap.png` / `fig_variance_aware.png` / `fig_ablation.png` | 评分函数 / RL 避高方差链路 / 归因消融 |
 | **端到端 sim-to-real** | `python3 research/harness/rl_e2e_latency.py` | 真 RL 模型选低方差 holder(var 0.11 vs greedy 1.69)→ 真 corrosion 路由查询 P50 **16ms vs 207ms** |
 | **集群 placement 真跑** | `python3 research/harness/rl_placement_e2e.py --nodes 9 --repeats 3` | RL placement 驱动真 selector 推送:达标 ↓94.8% vs 广播;含 random_cut 同副本预算基线 + resolve 合成对照 |
+| **critical 传输优先级(「优先/及时」)** | `python3 research/harness/critical_latency_test.py --nodes 6 --rows 15` | `gossip.critical_tables` 立即 flush 跳过攒批:critical 表多跳到达时延 **13ms vs 普通 182ms(↓93%)**(报告 §4.5) |
 
 **RL 优势分两部分**:① 基数(高写少存→字节)= **已由 4.4.3 降量验证**;② 方差规避(查询密集放稳定 holder→延迟)= `rl_e2e_latency.py` 验证。
 **诚实**:字节量上显示不出②(corrosion anti-entropy/多路径太鲁棒,实测丢包反更省字节),故改测**查询路由延迟**;链路注入用应用层(`transport.rs` `CORRO_LINK_FAULTS`,无 sudo),QUIC 重传级高保真留 dummynet 附录。

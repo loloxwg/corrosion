@@ -142,6 +142,30 @@ app 层给坏链路注入丢包,corrosion 的 anti-entropy 补传**比逐条 bro
 
 **故 RL 归位在瞬态层**(符合合同 4.3.3"目标平台/路径"的措辞,"谁长期持有"=interest 规则,静态安全)。这也界定了未尽工程:若未来要动态 placement,须先补"重新关心→scoped 回填 + handoff 纪律 + 推送/对账 interest 口径统一"的安全协议(见 §6 未尽事项)。
 
+### 4.5 critical 表传输优先级(「优先…及时推送」的落地,已实验验证)
+
+合同 4.3.3 要求「**优先**将作战任务目标态势数据**及时**、精准推送」。"精准"由 interest+GNN
+承担(发给谁);"优先/及时"此前无传输层机制——所有表的广播共用攒批缓冲,scope 不变时最多等
+`bcast_interval`(500ms)tick 才发,**每一跳 rebroadcast 都要再等一次** → 多跳时延
+O(跳数×攒批间隔)。
+
+**机制**:`gossip.critical_tables`(如 `["target"]`)里的表触发广播缓冲**立即 flush**
+(本地全局路径 + 每跳 rebroadcast 路径),当轮发送 → critical 数据多跳时延降为 O(跳数×RTT)。
+空配置=行为不变(全表同等攒批)。与 `graphrl.critical_tables`(GNN 特征,模型面)独立,
+这里是传输优先级(数据面)。
+
+**实测**(`critical_latency_test.py`,复用多跳场景:writer→needer 直连切死逼数据走中继
+rebroadcast——攒批延迟正住在那条路径;sync 拉长隔离;逐行写、needer 直读细粒度轮询):
+
+| 表 | needer 单行到达时延(≥2 跳) |
+|---|---|
+| flight(普通,攒批) | 中位 **182ms**,P90 333ms(≈uniform(0,500ms) tick 等待) |
+| target(critical,立即 flush) | 中位 **13ms**,P90 16ms(**↓93%**) |
+
+证据:直连丢弃计数 53(切断生效)、critical flush 计数 90(机制真在触发)。
+**诚实边界**:localhost RTT≈0,真实网络时延下限=跳数×真 RTT;critical 表写入频繁时立即
+flush 会牺牲攒批吞吐(时效换吞吐,正是"优先"的语义);半实物复核待里程碑 2。
+
 ## 5. 不确定链路通断下的多跳路由(4.2.3,已实验验证)
 
 **机制论证**:本方案的多跳路由 = 两条互补路径,均保留 corrosion 原生机制、interest 过滤叠加其上:
@@ -183,7 +207,7 @@ RTT 均匀,真实异构网络多跳绕行代价不会是 0;debug 构建 sync 默
 | 4.4.3 全局传输降 30% | ✅ localhost 54~77%(42 节点 54%,外推 100 节点≈44%,均>30%;待半实物复核) | `sweep.py` 多规模重复均值+误差带;`verify_phase2.py` 部分复制(业务表+buffered 双层)+无死锁 |
 | 4.4.2 任意节点查 + 1M QPS | 查询路由 ✅ correctness;1M=单节点微基准外推(**未半实物验证**) | `query_routing_test.py` 路由正确;`qps_bench.py` 单节点≥25K→×100 外推 2.5M,500Kbps 路由上限442K |
 | 4.2.3 数据需求模版 + gossip 多跳 + 模型 | ✅(多跳已实验验证,§5) | `node_interest` 模版(节点启动**自写**);`multihop_test.py` 直连断→中继多跳 0.4s 收齐 / 快路径全断→sync 兜底;GNN+DRL 模型 |
-| 4.3.3 GNN+DRL 适配度评分函数 | ✅ 核心验证 + 端到端;集群级归因诚实(§4.4) | 监督省 65% + RL 鲁棒省 69%;3 张证据图;`rl_e2e_latency.py` 受控 16 vs 207ms(13×);`rl_placement_e2e.py` 集群逐层证「三处吸收」;RL 安全归位瞬态选路 `BroadcastStrategy::Rl` |
+| 4.3.3 GNN+DRL 适配度评分函数 | ✅ 核心验证 + 端到端;集群级归因诚实(§4.4);「优先/及时」传输优先级 ✅(§4.5) | 监督省 65% + RL 鲁棒省 69%;3 张证据图;`rl_e2e_latency.py` 受控 16 vs 207ms(13×);`rl_placement_e2e.py` 集群逐层证「三处吸收」;RL 安全归位瞬态选路 `BroadcastStrategy::Rl`;`critical_latency_test.py` critical 表多跳时延 13 vs 182ms(↓93%) |
 
 **生产侧 interest 写入(本轮收口)**:corrosion 启动时从 `gossip.interest` 配置**自写** `node_interest`
 (`run_root.rs::write_own_interest`),不再依赖外部/harness 写入,且启动即可见(减轻传播竞态)。

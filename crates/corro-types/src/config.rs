@@ -251,6 +251,13 @@ pub struct GossipConfig {
     /// 空=不启用(Rl 回退手设方差启发式)。
     #[serde(default)]
     pub graphrl: Option<GraphRlConfig>,
+    /// critical(时效敏感)表:其广播跳过攒批延迟(缓冲立即 flush,不等 bcast_interval
+    /// 500ms tick),每一跳 rebroadcast 同样生效 → 多跳时延从 O(跳数×攒批间隔) 降到
+    /// O(跳数×RTT)。对应 4.3.3「优先将作战任务目标态势数据及时、精准推送」的"及时"。
+    /// 与 graphrl.critical_tables(GNN 特征,模型面)独立:这里是传输优先级(数据面)。
+    /// 空=不启用,全部表同等攒批。
+    #[serde(default)]
+    pub critical_tables: Vec<String>,
 }
 
 /// 内嵌 GNN 配置(任务模版级静态:权重路径 + 数据属性 + 角色映射 + critical)。
@@ -612,6 +619,7 @@ impl ConfigBuilder {
                 interest_routing: Default::default(),
                 interest: Default::default(),
                 graphrl: None,
+                critical_tables: Default::default(),
             },
             perf: self.perf.unwrap_or_default(),
             admin: AdminConfig {

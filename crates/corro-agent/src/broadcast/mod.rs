@@ -637,6 +637,17 @@ async fn handle_broadcasts(
 
     let mut rate_limited = false;
 
+    // critical(时效敏感)表:其广播缓冲立即 flush,不等 bcast_interval tick——
+    // 每跳 rebroadcast 同样生效,多跳时延从 O(跳数×攒批间隔) 降到 O(跳数×RTT)。
+    // 对应 4.3.3「优先…及时推送」;空=不启用(全表同等攒批,行为不变)。
+    let critical_tables: HashSet<String> = agent
+        .config()
+        .gossip
+        .critical_tables
+        .iter()
+        .cloned()
+        .collect();
+
     // 推送端 interest 缓存：表 -> 关心它的 peer 地址。来源 node_interest 复制表，
     // InterestRefresh tick(3s)周期刷新；为空时回退到静态 interest_routing 配置(兼容/关闭态)。
     let mut interest_routing = load_interest_routing(&agent).await;
@@ -738,6 +749,13 @@ async fn handle_broadcasts(
                 } else {
                     None
                 };
+                // critical 表(时效敏感):本条广播触发缓冲立即 flush,当轮就发,
+                // 不等 bcast_interval(默认 500ms)tick——"及时"落在传输层。
+                let is_critical = !critical_tables.is_empty()
+                    && tables.iter().any(|t| critical_tables.contains(t));
+                if is_critical {
+                    counter!("corro.broadcast.critical.flush").increment(1);
+                }
 
                 if let Err(e) = (UniPayload::V1 {
                     data: UniPayloadV1::Broadcast(bcast.clone()),
@@ -777,7 +795,7 @@ async fn handle_broadcasts(
                     local_bcast_buf.extend_from_slice(&payload);
                     local_tables.extend(tables.iter().cloned());
 
-                    if local_bcast_buf.len() >= broadcast_cutoff {
+                    if local_bcast_buf.len() >= broadcast_cutoff || is_critical {
                         to_broadcast.push_front(PendingBroadcast::with_tables(
                             local_bcast_buf.split().freeze(),
                             true,
@@ -801,7 +819,7 @@ async fn handle_broadcasts(
                     }
                     bcast_tables.extend(tables.iter().cloned());
 
-                    if bcast_buf.len() >= broadcast_cutoff {
+                    if bcast_buf.len() >= broadcast_cutoff || is_critical {
                         to_broadcast.push_front(PendingBroadcast::with_tables(
                             bcast_buf.split().freeze(),
                             false,
