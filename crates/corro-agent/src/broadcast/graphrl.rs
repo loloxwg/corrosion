@@ -20,6 +20,17 @@ pub struct Linear {
 }
 
 impl Linear {
+    /// 输入维度(要求所有权重行等宽,否则 None)。
+    fn in_dim(&self) -> Option<usize> {
+        let w = self.weight.first()?.len();
+        (self.weight.iter().all(|r| r.len() == w) && self.weight.len() == self.bias.len())
+            .then_some(w)
+    }
+
+    fn out_dim(&self) -> usize {
+        self.bias.len()
+    }
+
     /// y = W x + b(单向量)。
     fn forward(&self, x: &[f32]) -> Vec<f32> {
         self.weight
@@ -85,6 +96,48 @@ impl GraphRl {
     /// 从导出 JSON 的 `weights` 对象反序列化。
     pub fn from_weights_json(v: &serde_json::Value) -> Result<Self, String> {
         serde_json::from_value(v.clone()).map_err(|e| format!("GraphRl 权重解析失败: {e}"))
+    }
+
+    /// 权重 shape 校验(加载时调,配错即拒载退回启发式)。
+    /// 必须做:`Linear::forward` 的 zip 在维度不匹配时**静默截断**而非报错——
+    /// 配置的角色数与训练时不一致(plat 特征=n_roles+2)会悄悄算出错位的垃圾分。
+    pub fn validate(&self, n_roles: usize) -> Result<(), String> {
+        let dim = |l: &Linear, name: &str| {
+            l.in_dim()
+                .ok_or_else(|| format!("{name} 权重行宽不一致或与 bias 长度不符"))
+        };
+        let h = self.plat_enc.out_dim();
+        let want_plat_in = n_roles + 2;
+        let plat_in = dim(&self.plat_enc, "plat_enc")?;
+        if plat_in != want_plat_in {
+            return Err(format!(
+                "plat_enc 输入维 {plat_in} ≠ 角色数+2={want_plat_in}(config roles 数与训练不一致?)"
+            ));
+        }
+        if dim(&self.data_enc, "data_enc")? != 2 || self.data_enc.out_dim() != h {
+            return Err("data_enc 应为 2 → h".into());
+        }
+        if self.upd_plat.is_empty() || self.upd_plat.len() != self.upd_data.len() {
+            return Err(format!(
+                "消息传递轮数不符: upd_plat={} upd_data={}",
+                self.upd_plat.len(),
+                self.upd_data.len()
+            ));
+        }
+        for (r, (up, ud)) in self.upd_plat.iter().zip(&self.upd_data).enumerate() {
+            for (l, name) in [(up, "upd_plat"), (ud, "upd_data")] {
+                if dim(l, name)? != 2 * h || l.out_dim() != h {
+                    return Err(format!("{name}[{r}] 应为 2h → h(h={h})"));
+                }
+            }
+        }
+        if dim(&self.score_0, "score_0")? != 2 * h + 6 {
+            return Err(format!("score_0 输入维应为 2h+6={}", 2 * h + 6));
+        }
+        if dim(&self.score_2, "score_2")? != self.score_0.out_dim() || self.score_2.out_dim() != 1 {
+            return Err("score_2 应为 score_0 输出维 → 1".into());
+        }
+        Ok(())
     }
 
     /// 前向:态势 → score(数据 d, 平台 p) 的 D×P logits 矩阵(与 model.py forward 对齐)。
@@ -250,11 +303,17 @@ impl GraphRl {
             .iter()
             .map(|t| vec![t.write_vol, t.query_vol])
             .collect();
+        // wildcard:声明 `*` 的 peer 关心全部表 → 对每张表 needer=1。
+        // 与 selector::interested_set 口径对齐,否则全量节点在合法集内却被 GNN 主信号压到队尾。
         let interested = |table: &str, addr: &SocketAddr| -> bool {
             interest_routing
                 .get(table)
                 .map(|v| v.contains(addr))
                 .unwrap_or(false)
+                || interest_routing
+                    .get("*")
+                    .map(|v| v.contains(addr))
+                    .unwrap_or(false)
         };
         let needer: Vec<Vec<f32>> = cfg
             .tables
@@ -291,6 +350,71 @@ impl GraphRl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use corro_types::config::{GraphRlRole, GraphRlTable};
+
+    fn zeros(out: usize, inp: usize) -> Linear {
+        Linear { weight: vec![vec![0.0; inp]; out], bias: vec![0.0; out] }
+    }
+
+    /// 手造最小合法模型(h=2,n_roles=1):编码/消息传递全零,
+    /// 打分头只透传边特征里的 needer(feat[2h+2]=needer)→ logit = needer。
+    /// 用于可控地观察某特征是否进了模型。
+    fn needer_probe_model() -> GraphRl {
+        let h = 2;
+        let mut score_0 = zeros(1, 2 * h + 6);
+        score_0.weight[0][2 * h + 2] = 1.0; // edge[2] = needer
+        let mut score_2 = zeros(1, 1);
+        score_2.weight[0][0] = 1.0;
+        GraphRl {
+            plat_enc: zeros(h, 1 + 2), // n_roles=1
+            data_enc: zeros(h, 2),
+            upd_plat: vec![zeros(h, 2 * h)],
+            upd_data: vec![zeros(h, 2 * h)],
+            score_0,
+            score_2,
+        }
+    }
+
+    #[test]
+    fn validate_rejects_role_mismatch() {
+        let m = needer_probe_model(); // 按 n_roles=1 造
+        assert!(m.validate(1).is_ok(), "匹配的角色数应通过");
+        let err = m.validate(3).unwrap_err();
+        assert!(err.contains("plat_enc"), "角色数不符须在 plat_enc 处拒载: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_ragged_weights() {
+        let mut m = needer_probe_model();
+        m.score_0.weight[0].pop(); // 行宽破坏
+        assert!(m.validate(1).is_err(), "行宽不一致须拒载");
+    }
+
+    #[test]
+    fn wildcard_peer_counts_as_needer() {
+        // B 声明 "*"(关心全部):GNN needer 特征应=1(与 selector interested_set 口径对齐),
+        // 探针模型 logit=needer → score(flight,B)=sigmoid(1)>0.7;不关心的 C 应=sigmoid(0)=0.5。
+        let m = needer_probe_model();
+        let cfg = GraphRlConfig {
+            weights_path: String::new(),
+            tables: vec![GraphRlTable { name: "flight".into(), write_vol: 0.0, query_vol: 0.0 }],
+            roles: vec![GraphRlRole { name: "recon".into(), tables: vec!["flight".into()] }],
+            critical_tables: vec![],
+        };
+        let a: SocketAddr = "[::1]:9000".parse().unwrap(); // 精确关心 flight
+        let b: SocketAddr = "[::1]:9001".parse().unwrap(); // wildcard
+        let c: SocketAddr = "[::1]:9002".parse().unwrap(); // 不关心(只出现在别的表)
+        let mut routing = HashMap::new();
+        routing.insert("flight".to_string(), vec![a]);
+        routing.insert("*".to_string(), vec![b]);
+        routing.insert("other".to_string(), vec![c]);
+        let zero_link = |_: &SocketAddr| LinkInfo { link_cost: 0.0, link_var: 0.0 };
+        let scores = m.score_table(&cfg, &routing, zero_link);
+        let s = |addr| scores[&("flight".to_string(), addr)];
+        assert!(s(a) > 0.7, "精确关心者 needer=1: {}", s(a));
+        assert!(s(b) > 0.7, "wildcard 关心者 needer 应=1: {}", s(b));
+        assert!((s(c) - 0.5).abs() < 1e-4, "不关心者 needer=0: {}", s(c));
+    }
 
     #[test]
     fn parity_matches_python() {
@@ -305,6 +429,8 @@ mod tests {
         };
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let model = GraphRl::from_weights_json(&v["weights"]).unwrap();
+        // 真权重须过 shape 校验(训练 ROLES=3:recon/strike/jam)——防 validate 误杀生产权重。
+        model.validate(3).expect("导出的真权重应通过 shape 校验");
 
         let refn = &v["reference"];
         let inp = &refn["input"];

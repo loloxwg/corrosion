@@ -126,6 +126,12 @@ fn load_graphrl_model(agent: &Agent) -> Option<graphrl::GraphRl> {
     };
     match graphrl::GraphRl::from_weights_json(&v["weights"]) {
         Ok(m) => {
+            // shape 校验:Linear::forward 维度不匹配会静默截断算出垃圾分,
+            // 配错(如 roles 数与训练不一致)必须在加载时拒掉,退回启发式。
+            if let Err(e) = m.validate(cfg.roles.len()) {
+                warn!("graphrl: 权重 shape 校验失败,拒载退回启发式: {e}");
+                return None;
+            }
             info!("graphrl: 已加载内嵌 GNN 权重 {}", cfg.weights_path);
             Some(m)
         }
