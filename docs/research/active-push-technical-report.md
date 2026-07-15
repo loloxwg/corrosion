@@ -153,10 +153,10 @@ app 层给坏链路注入丢包,corrosion 的 anti-entropy 补传**比逐条 bro
 **副产品(独立真改进)**:为解锁 RL 而做的 `resolve_table_holder` 从「选 SQL 首个」→「选 RTT 最优 holder」,本身是独立于 RL 的正确生产改进(异构网络查询路由到最近 holder);合成对调探针证明其生效(target 放 {快+慢},对调角色后 `{both}` 恒命中快 holder)。
 
 **RL 的安全归位(关键设计决策)**:RL 有两种可能落点——
-- **动态 placement(谁长期持有,durability 层)**:❌ **不安全**。实测(`dynamic_interest_hole.py`)坐实一个正确性 bug:节点动态"重新关心"某表时,对账早先把该表版本发 `Changeset::Empty`→标 `Cleared` 关 gap→**永不重取**→本地永久缺历史数据,却以 holder 身份对外服务不完整结果(NodeR 重新关心后 0/15,对照 15/15)。Codex 复核确认真 bug + 推送/对账读两套 interest 状态。
+- **动态 placement(谁长期持有,durability 层)**:⚠ **扩大 interest 的历史回填已修复，完整动态摘除仍不安全**。旧实现中 NodeR 重新关心后本地 0/15；现通过持久记录 filtered version ranges、interest 扩大时原子重开 gaps，同一端到端场景恢复为本地/API 15/15。摘除 interest 前的 handoff/min_replicas 门禁及在线统一 interest 状态尚未实现。
 - **瞬态选路(这条广播发给谁/扇出/路径)**:✅ **安全**。合法范围由 interest 规则圈定,RL 只在集内优化,**推错自愈**(anti-entropy 兜底,不改 placement/不碰 durability)。已实现为 `BroadcastStrategy::Rl`(方差感知,单测+e2e)。
 
-**故 RL 归位在瞬态层**(符合合同 4.3.3"目标平台/路径"的措辞,"谁长期持有"=interest 规则,静态安全)。这也界定了未尽工程:若未来要动态 placement,须先补"重新关心→scoped 回填 + handoff 纪律 + 推送/对账 interest 口径统一"的安全协议(见 §6 未尽事项)。
+**故 RL 归位在瞬态层**(符合合同 4.3.3"目标平台/路径"的措辞,"谁长期持有"=interest 规则,静态安全)。历史回填已补；若未来要动态 placement，还须补 handoff 纪律、路由发布门禁和推送/对账 interest 口径统一(见 §6 未尽事项)。
 
 ### 4.5 critical 表传输优先级(「优先…及时推送」的落地,已实验验证)
 
@@ -235,15 +235,15 @@ RTT 均匀,真实异构网络多跳绕行代价不会是 0;debug 构建 sync 默
 (`resolve_table_holder` 匹配 `table=? OR '*'`)。`wildcard_test.py` 实测:`*` 节点本地收全 3 表、
 共存的 jam 节点仍只有 target(部分复制不被破坏)、jam 经路由从 `*` 持有者取回 flight。
 
-**动态 interest 安全边界(本轮收口,★正确性)**:实测坐实(`dynamic_interest_hole.py` + Codex 复核)一个**动态 placement 的正确性 bug**——
-- **机制**:节点先不关心表 T 时,对账把 T 的版本发 `Changeset::Empty` → `process_empty_version` 标 `KnownDbVersion::Cleared` → 从 `__corro_bookkeeping_gaps` 删该 gap;`generate_sync` 的 need 计算里 `Cleared` 与「真有完整数据」**不区分**(`bookie.rs` `contains_version`)→ 节点动态"重新关心"T 后**永不重取**那些版本 → 本地永久缺 T 的历史数据,却以 holder 身份对查询本地答不完整结果(实测 NodeR 重新关心后 0/15,对照 NodeS 15/15)。另 Codex 发现推送侧读运行时 `node_interest`、对账侧读静态 `gossip.interest` 配置,**两套 interest 状态分裂**。
-- **收口结论**:**静态 interest(本项目所有考核/实验用法)完全安全**——CRDT 值不分叉、不删本地数据、部分复制正确。bug **仅在动态变更 interest 时触发**(见 §4.4:这也是 RL 归位瞬态层、不做动态 placement 的原因之一)。
-- **若未来需动态 placement**,最小安全协议:① 重新关心 T 时,把 T 相关的已 `Cleared` 版本重新插回 gaps 触发 scoped 回填(需给 `Changeset::Empty` 带表集合,或保守全段重开);② 失去 interest 的 handoff 纪律(≥min_replicas 当前 holder 已持有再摘除路由);③ 推送/对账 interest 口径统一(都读 `node_interest`);④ 回填需集群有全量/wildcard holder 留完整历史作源。列为独立立项。
+**动态 interest 安全边界(2026-07-15 修复,★正确性)**:
+- **旧故障**:节点先不关心表 T 时，过滤版本被 `Empty→Cleared`，扩大 interest 后 `generate_sync` 不再请求；实测 NodeR 本地/API 均为 0/15。
+- **修复**:部分同步收到 Empty 时，在同一事务持久记录 `__corro_filtered_version_ranges`；启动持久化有效 interest，检测集合扩大后在 bookie writer lock + SQLite 事务内重开对应 gaps，提交后才启动 sync。失败则阻止 agent 启动，避免假 holder。回归用例翻转为 NodeR 本地/API 15/15，详见 [`dynamic-interest-backfill.md`](dynamic-interest-backfill.md)。
+- **剩余边界**:静态 interest 与“扩大 interest 后回填”安全；完整动态 placement 仍缺失去 interest 前的 handoff/min_replicas 门禁、路由发布门禁，以及推送侧 `node_interest` 与对账侧配置的在线统一。
 
 **未尽事项(诚实)**:① 100 agent 单机已测,仍需多物理机 + 500Kbps 半实物真聚合,尤其补齐 1M QPS;
 ② 高并发缓存/连接池调优;
 ③ RL 链路优势的 **dummynet/QUIC 重传**高保真复核(本期已用应用层延迟注入端到端验证查询延迟优势,§4.3);
-④ 单事务多表的行级精度(scoped bookie,高风险);⑤ **动态 interest/placement 安全协议**(上段:静态安全,动态有已坐实数据洞 bug,须补 scoped 回填+handoff+口径统一,独立立项)。
+④ 单事务多表的行级精度(scoped bookie,高风险);⑤ **动态 interest 摘除协议**(历史回填已完成；仍需 handoff/min_replicas、路由发布门禁和在线统一 interest)。
 
 **方法学**:全程"设计 → Codex 对抗复核 → 实现 → 实测(重复均值)→ 诚实记录(含失败)",
 多处靠 Codex 复核纠偏(payload 混表根因、一进程约束下路线选择、RL 奖励 hacking 防护、稳定化、1M QPS 可达性骨架)。

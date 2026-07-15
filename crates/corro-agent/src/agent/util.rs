@@ -24,7 +24,7 @@ use corro_types::{
     bookie::BookieDbParams,
     broadcast::{ChangeSource, ChangeV1, Changeset, ChangesetParts, FocaCmd, FocaInput},
     channel::CorroReceiver,
-    config::AuthzConfig,
+    config::{AuthzConfig, BroadcastStrategy},
     pubsub::SubsManager,
     schema::{apply_schema, parse_sql},
     sqlite::unnest_param,
@@ -1023,6 +1023,19 @@ pub async fn process_multiple_changes(
                             version: Some(change.versions().end()),
                         },
                     )?;
+                    if sync_interest_is_filtered(&agent) {
+                        record_filtered_version_range(
+                            &tx,
+                            change.actor_id,
+                            versions.start(),
+                            versions.end(),
+                        )
+                        .map_err(|source| ChangeError::Rusqlite {
+                            source,
+                            actor_id: Some(change.actor_id),
+                            version: Some(versions.end()),
+                        })?;
+                    }
                     KnownDbVersion::Cleared
                 } else {
                     if let Some(seqs) = change.seqs() {
@@ -1224,6 +1237,28 @@ pub fn process_empty_version<T: Deref<Target = rusqlite::Connection> + Committab
             .query_row((actor_id, versions.end()), |row| row.get::<_, String>(0))?;
     }
 
+    Ok(())
+}
+
+fn sync_interest_is_filtered(agent: &Agent) -> bool {
+    let cfg = agent.config();
+    !matches!(cfg.gossip.broadcast_strategy, BroadcastStrategy::Random)
+        && !cfg.gossip.interest.is_empty()
+        && !cfg.gossip.interest.iter().any(|table| table == "*")
+}
+
+fn record_filtered_version_range<T: Deref<Target = rusqlite::Connection> + Committable>(
+    tx: &InterruptibleTransaction<T>,
+    actor_id: ActorId,
+    start: CrsqlDbVersion,
+    end: CrsqlDbVersion,
+) -> rusqlite::Result<()> {
+    tx.prepare_cached(
+        "INSERT INTO __corro_filtered_version_ranges (actor_id, start, end) \
+         VALUES (?, ?, ?) \
+         ON CONFLICT (actor_id, start) DO UPDATE SET end = MAX(end, excluded.end)",
+    )?
+    .execute(params![actor_id, start, end])?;
     Ok(())
 }
 

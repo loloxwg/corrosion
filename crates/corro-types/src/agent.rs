@@ -310,6 +310,7 @@ pub fn migrate(clock: Arc<uhlc::HLC>, conn: &mut Connection) -> rusqlite::Result
     let migrations: Vec<Box<dyn Migration>> = vec![
         Box::new(init_migration as fn(&Transaction) -> rusqlite::Result<()>),
         Box::new(crsqlite_v0_17_migration(clock)),
+        Box::new(interest_backfill_migration as fn(&Transaction) -> rusqlite::Result<()>),
     ];
 
     crate::sqlite::migrate(conn, migrations)
@@ -398,6 +399,23 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
     )?;
 
     Ok(())
+}
+
+/// Persist version ranges that were acknowledged as empty while sync interest
+/// filtering was active. If the local interest later expands, the agent can
+/// reopen exactly these ranges instead of replaying every historical version.
+fn interest_backfill_migration(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        r#"
+        CREATE TABLE __corro_filtered_version_ranges (
+            actor_id BLOB NOT NULL,
+            start INTEGER NOT NULL,
+            end INTEGER NOT NULL,
+
+            PRIMARY KEY (actor_id, start)
+        ) WITHOUT ROWID;
+        "#,
+    )
 }
 
 // since crsqlite 0.17, ts is now stored as TEXT in clock tables

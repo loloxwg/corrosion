@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""失败用例:动态 interest 变更 → 永久数据洞(证 RL 跑中改 placement 的正确性 bug)。
+"""回归用例:动态 interest 扩大后必须回填此前被过滤的历史版本。
 
 假说(代码推理 + Codex 复核确认):
   节点 R 先不关心 target(gossip.interest=[flight])→ 对账把 target 版本当空版本发
@@ -12,8 +12,8 @@
   NodeR  先 interest=[flight],后"重新关心"target(改 node_interest + 重启带新 gossip.interest)。
   NodeS  从头就 interest=[flight,target](对照组,应拿到全部 target)。
 
-判定:若 NodeR 重新关心 + 充分 settle 后,直读 sqlite 仍缺 target 历史行(而 NodeS 全有)
-      → ✅ 复现永久数据洞(bug 坐实)。若 NodeR 补齐 → 假说被推翻(有救援路径)。
+判定:NodeR 在旧 interest 下应持久记录 filtered version ranges；重新关心并重启后，
+     直读 SQLite、对照节点和 API 查询都必须得到完整历史。任何一项不满足均返回非零。
 
 用法: python3 research/harness/dynamic_interest_hole.py
 """
@@ -87,6 +87,11 @@ def local_count(nd, table, prefix):
     return H.count_rows_local(nd, table, prefix)
 
 
+def local_scalar(nd, sql):
+    r = H.sh(["sqlite3", nd["db"], sql])
+    return int(r.stdout.strip())
+
+
 def main():
     subprocess.run(["pkill", "-9", "-f", "target/debug/corrosion"], capture_output=True)
     time.sleep(2)
@@ -129,8 +134,11 @@ def main():
 
         r1 = local_count(nodes[1], "target", prefix)
         s1 = local_count(nodes[2], "target", prefix)
+        tracked = local_scalar(
+            nodes[1], "SELECT count(*) FROM __corro_filtered_version_ranges")
         print(f"  直读 sqlite:NodeR(不关心)target={r1}  NodeS(对照,关心)target={s1}")
         print(f"  预期:NodeR=0(被 Empty→Cleared),NodeS={ROWS}(对照拿到)")
+        print(f"  NodeR 持久化 filtered version ranges={tracked}(预期 >0)")
 
         print("\n阶段2:NodeR 重新关心 target(改 node_interest + 重启带新 gossip.interest)")
         # ① 动态改 node_interest(推送/查询侧看的)
@@ -162,17 +170,12 @@ def main():
         print(f"  NodeR 重新关心后 直读本地 target = {r2} / {ROWS}")
         print(f"  NodeS 对照            直读本地 target = {s2} / {ROWS}(证明数据在集群有源)")
         print(f"  NodeR 经 API 查询(它现在是 holder)target = {rq}")
-        if r2 < ROWS and s2 == ROWS:
-            print(f"\n  ❌✅ 复现永久数据洞:NodeR 重新关心 target 后,对账未回填历史"
-                  f"({r2}<{ROWS}),而集群里数据是有的(NodeS={s2})。")
-            print(f"     → Changeset::Empty→Cleared 关 gap,重新关心不重开 → 静默丢数据。bug 坐实。")
-            if rq == ROWS:
-                print(f"     ⚠ 更危险:API 查询返回 {rq}(靠查询路由从别的 holder 拿),"
-                      f"掩盖了本地缺失 {ROWS - r2} 行 → 若路由到 NodeR 自己则返回不完整。")
-        elif r2 == ROWS:
-            print(f"\n  ✅ 假说被推翻:NodeR 补齐了 target({r2}={ROWS})→ 存在救援/回填路径,不是永久洞。")
+        if tracked > 0 and r1 == 0 and r2 == ROWS and s2 == ROWS and rq == ROWS:
+            print(f"\n  ✅ PASS:NodeR interest 扩大后，本地历史已完整回填({r2}/{ROWS})。")
         else:
-            print(f"\n  ⚠ 结果不明确(NodeR={r2}, NodeS={s2}),需查 settle/传播时序。")
+            print(f"\n  ❌ FAIL:tracked={tracked},阶段1本地={r1},"
+                  f"回填后本地={r2},对照={s2},API={rq},期望={ROWS}。")
+            raise SystemExit(1)
     finally:
         stop_all()
 

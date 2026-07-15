@@ -402,6 +402,23 @@ impl BookedVersions {
         gaps
     }
 
+    /// Reopen previously cleared versions as sync gaps without advancing the
+    /// actor head. Existing gaps are rewritten in their merged canonical form
+    /// so the in-memory range set and `__corro_bookkeeping_gaps` stay aligned.
+    pub fn compute_and_apply_reopened_gaps(
+        &mut self,
+        db_versions: RangeInclusiveSet<CrsqlDbVersion>,
+    ) -> GapsChanges {
+        let previous = self.needed.clone();
+        self.needed.extend(db_versions);
+
+        GapsChanges {
+            max: self.max,
+            insert_set: self.needed.clone(),
+            remove_ranges: previous.iter().cloned().collect(),
+        }
+    }
+
     /// Compute which partials to clear, apply in-memory, return `ComputedChanges` with only clears populated.
     pub fn compute_and_apply_clear_partials(
         &mut self,
@@ -1172,6 +1189,30 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn reopened_gaps_preserve_head_and_merge_existing_ranges() {
+        let actor_id = ActorId(uuid::Uuid::new_v4());
+        let mut bv = BookedVersions::new(actor_id);
+        bv.max = Some(CrsqlDbVersion(12));
+        bv.needed.insert(dbvri!(4, 5));
+
+        let changes = bv.compute_and_apply_reopened_gaps(RangeInclusiveSet::from_iter([
+            dbvri!(6, 8),
+            dbvri!(10, 11),
+        ]));
+
+        assert_eq!(bv.max, Some(CrsqlDbVersion(12)));
+        assert_eq!(
+            bv.needed.iter().cloned().collect::<Vec<_>>(),
+            vec![dbvri!(4, 8), dbvri!(10, 11)]
+        );
+        assert_eq!(changes.remove_ranges, HashSet::from_iter([dbvri!(4, 5)]));
+        assert_eq!(
+            changes.insert_set.iter().cloned().collect::<Vec<_>>(),
+            vec![dbvri!(4, 8), dbvri!(10, 11)]
+        );
     }
 
     fn insert_everywhere(

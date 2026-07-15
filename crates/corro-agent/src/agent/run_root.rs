@@ -1,6 +1,9 @@
 //! Start the root agent tasks
 
-use std::time::Instant;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Instant,
+};
 
 use crate::agent::util::execute_schema_from_paths;
 use crate::{
@@ -16,15 +19,19 @@ use crate::{
 
 use crate::api::public::make_broadcastable_changes;
 use corro_types::{
+    actor::ActorId,
     agent::{Agent, Bookie, ChangeError},
-    base::CrsqlSeq,
+    base::{CrsqlDbVersion, CrsqlSeq},
+    bookie::{BookieDbParams, ComputedChanges},
     channel::bounded,
-    config::{Config, PerfConfig},
+    config::{BroadcastStrategy, Config, PerfConfig},
 };
 
 use futures::FutureExt;
+use rangemap::RangeInclusiveSet;
+use rusqlite::{params, OptionalExtension};
 use spawn::spawn_counted;
-use tokio::task::JoinHandle;
+use tokio::task::{block_in_place, JoinHandle};
 use tracing::{error, info, warn};
 use tripwire::Tripwire;
 
@@ -117,6 +124,16 @@ async fn run(
     // 自写 interest:从 gossip.interest 写入复制表 node_interest(4.2.3 数据需求模版的节点自描述)。
     // 让 interest 配置化、不依赖外部写,且启动即可见(减轻传播竞态)。schema 须含 node_interest 表。
     write_own_interest(&agent).await;
+
+    // interest 扩大时，必须先重新打开此前因过滤而 Cleared 的版本，再启动 sync loop。
+    // 失败时停止启动，避免节点以 holder 身份对外提供不完整历史。
+    let reopened = reopen_filtered_versions_after_interest_expansion(&agent).await?;
+    if reopened > 0 {
+        info!(
+            reopened_versions = reopened,
+            "reopened filtered versions after interest expansion"
+        );
+    }
 
     let mut handles = vec![];
     // Setup client http API
@@ -282,5 +299,137 @@ async fn write_own_interest(agent: &Agent) {
         Err(e) => {
             warn!("could not write node_interest (is the node_interest table in your schema?): {e}")
         }
+    }
+}
+
+const SYNC_INTEREST_STATE_KEY: &str = "sync_interest_v1";
+
+fn effective_sync_interest(agent: &Agent) -> Vec<String> {
+    let cfg = agent.config();
+    if matches!(cfg.gossip.broadcast_strategy, BroadcastStrategy::Random)
+        || cfg.gossip.interest.is_empty()
+        || cfg.gossip.interest.iter().any(|table| table == "*")
+    {
+        return vec!["*".to_string()];
+    }
+
+    cfg.gossip
+        .interest
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn sync_interest_expanded(previous: &[String], current: &[String]) -> bool {
+    let previous_full = previous.iter().any(|table| table == "*");
+    let current_full = current.iter().any(|table| table == "*");
+    if previous_full {
+        return false;
+    }
+    if current_full {
+        return true;
+    }
+
+    let previous = previous.iter().collect::<BTreeSet<_>>();
+    current.iter().any(|table| !previous.contains(table))
+}
+
+async fn reopen_filtered_versions_after_interest_expansion(agent: &Agent) -> eyre::Result<u64> {
+    let current = effective_sync_interest(agent);
+    let current_json = serde_json::to_string(&current)?;
+    let bookie = agent.bookie().clone();
+    let mut conn = agent.pool().write_normal().await?;
+
+    block_in_place(move || {
+        let bookie_write = bookie.write_lock_blocking();
+        let tx = conn.immediate_transaction()?;
+        let previous_json: Option<String> = tx
+            .prepare_cached("SELECT value FROM __corro_state WHERE key = ?")?
+            .query_row([SYNC_INTEREST_STATE_KEY], |row| row.get(0))
+            .optional()?;
+        let previous = previous_json
+            .as_deref()
+            .map(serde_json::from_str::<Vec<String>>)
+            .transpose()?;
+        let expanded = previous
+            .as_deref()
+            .is_some_and(|previous| sync_interest_expanded(previous, &current));
+
+        let mut reopened: BTreeMap<ActorId, RangeInclusiveSet<CrsqlDbVersion>> = BTreeMap::new();
+        if expanded {
+            let mut stmt = tx.prepare_cached(
+                "SELECT actor_id, start, end FROM __corro_filtered_version_ranges",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, ActorId>(0)?,
+                    row.get::<_, CrsqlDbVersion>(1)?,
+                    row.get::<_, CrsqlDbVersion>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (actor_id, start, end) = row?;
+                reopened.entry(actor_id).or_default().insert(start..=end);
+            }
+        }
+
+        let reopened_count = reopened
+            .values()
+            .flat_map(|ranges| ranges.iter())
+            .map(|range| u64::from(*range.end()) - u64::from(*range.start()) + 1)
+            .sum();
+        let mut booked_writes = Vec::with_capacity(reopened.len());
+        let mut changes = Vec::with_capacity(reopened.len());
+        for (actor_id, ranges) in reopened {
+            let booked = bookie.ensure(actor_id);
+            let mut booked_write = bookie_write.write_tx(&booked);
+            let gaps = booked_write.compute_and_apply_reopened_gaps(ranges);
+            changes.push(ComputedChanges::new(actor_id).with_gaps(gaps));
+            booked_writes.push(booked_write);
+        }
+        BookieDbParams::from_changes(&changes).execute(&tx)?;
+
+        if expanded {
+            tx.execute("DELETE FROM __corro_filtered_version_ranges", [])?;
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO __corro_state (key, value) VALUES (?, ?)",
+            params![SYNC_INTEREST_STATE_KEY, current_json],
+        )?;
+        tx.commit()?;
+        for booked_write in booked_writes {
+            booked_write.commit();
+        }
+
+        Ok(reopened_count)
+    })
+}
+
+#[cfg(test)]
+mod interest_backfill_tests {
+    use super::sync_interest_expanded;
+
+    #[test]
+    fn detects_only_effective_interest_expansion() {
+        assert!(sync_interest_expanded(
+            &["flight".into()],
+            &["flight".into(), "target".into()]
+        ));
+        assert!(sync_interest_expanded(&["flight".into()], &["*".into()]));
+        assert!(sync_interest_expanded(
+            &["flight".into()],
+            &["target".into()]
+        ));
+        assert!(!sync_interest_expanded(
+            &["flight".into(), "target".into()],
+            &["flight".into()]
+        ));
+        assert!(!sync_interest_expanded(&["*".into()], &["flight".into()]));
+        assert!(!sync_interest_expanded(
+            &["flight".into()],
+            &["flight".into()]
+        ));
     }
 }
