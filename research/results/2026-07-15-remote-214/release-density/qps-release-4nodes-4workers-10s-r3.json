@@ -1,0 +1,143 @@
+{
+  "mode": "aggregate_concurrent_python",
+  "elapsed_s": 10.003063201904297,
+  "complete_requests": 487663,
+  "request_errors": 0,
+  "process_failures": 0,
+  "aggregate_qps_wall": 48751.36647213855,
+  "sum_worker_qps": 48765.57478122952,
+  "per_process_qps_min": 3030.8757923271555,
+  "per_process_qps_max": 3058.6747681267316,
+  "per_node_qps": {
+    "0": 12184.167743416609,
+    "3": 12200.4627519265,
+    "2": 12202.362170096365,
+    "1": 12164.373806699074
+  },
+  "per_node_qps_min": 12164.373806699074,
+  "per_node_qps_median": 12192.315247671555,
+  "per_node_qps_max": 12202.362170096365,
+  "nodes_at_or_above_10k": 4,
+  "samples": [
+    {
+      "node": 0,
+      "complete": 30309,
+      "errors": 0,
+      "elapsed_s": 10.000079870223999,
+      "qps": 3030.8757923271555
+    },
+    {
+      "node": 3,
+      "complete": 30535,
+      "errors": 0,
+      "elapsed_s": 10.000153303146362,
+      "qps": 3053.4531896018766
+    },
+    {
+      "node": 2,
+      "complete": 30533,
+      "errors": 0,
+      "elapsed_s": 10.000212669372559,
+      "qps": 3053.2350670414016
+    },
+    {
+      "node": 2,
+      "complete": 30496,
+      "errors": 0,
+      "elapsed_s": 10.000114440917969,
+      "qps": 3049.5651004970496
+    },
+    {
+      "node": 0,
+      "complete": 30464,
+      "errors": 0,
+      "elapsed_s": 10.0000581741333,
+      "qps": 3046.3822779351276
+    },
+    {
+      "node": 2,
+      "complete": 30481,
+      "errors": 0,
+      "elapsed_s": 10.00005841255188,
+      "qps": 3048.082195374063
+    },
+    {
+      "node": 1,
+      "complete": 30435,
+      "errors": 0,
+      "elapsed_s": 10.000073194503784,
+      "qps": 3043.4777234158255
+    },
+    {
+      "node": 1,
+      "complete": 30468,
+      "errors": 0,
+      "elapsed_s": 10.000271320343018,
+      "qps": 3046.717336360722
+    },
+    {
+      "node": 2,
+      "complete": 30551,
+      "errors": 0,
+      "elapsed_s": 10.000188112258911,
+      "qps": 3055.042530904844
+    },
+    {
+      "node": 3,
+      "complete": 30525,
+      "errors": 0,
+      "elapsed_s": 10.000040292739868,
+      "qps": 3052.4877006907127
+    },
+    {
+      "node": 0,
+      "complete": 30519,
+      "errors": 0,
+      "elapsed_s": 10.000276565551758,
+      "qps": 3051.815597293547
+    },
+    {
+      "node": 1,
+      "complete": 30452,
+      "errors": 0,
+      "elapsed_s": 10.000294923782349,
+      "qps": 3045.1101924584373
+    },
+    {
+      "node": 3,
+      "complete": 30517,
+      "errors": 0,
+      "elapsed_s": 10.000191926956177,
+      "qps": 3051.641430774885
+    },
+    {
+      "node": 0,
+      "complete": 30587,
+      "errors": 0,
+      "elapsed_s": 10.00008249282837,
+      "qps": 3058.6747681267316
+    },
+    {
+      "node": 3,
+      "complete": 30465,
+      "errors": 0,
+      "elapsed_s": 10.000059604644775,
+      "qps": 3046.481841553202
+    },
+    {
+      "node": 1,
+      "complete": 30326,
+      "errors": 0,
+      "elapsed_s": 10.000224113464355,
+      "qps": 3032.532036873945
+    }
+  ],
+  "nodes": 4,
+  "ab_parallel": 4,
+  "concurrency_per_ab": 16,
+  "requests_per_ab": 40000,
+  "requested_duration_s": 10.0,
+  "cpu_count": 20,
+  "driver": "python",
+  "corrosion_bin": "/home/xwg/dev/corrosion-active-push-validation/target/release/corrosion"
+}

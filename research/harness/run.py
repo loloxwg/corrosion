@@ -30,7 +30,7 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
-BIN = os.path.join(REPO, "target", "debug", "corrosion")
+BIN = os.environ.get("CORRO_BIN", os.path.join(REPO, "target", "debug", "corrosion"))
 WORK = "/tmp/corro-harness"
 
 # 任务角色 → 关心的数据表（数据需求模版）
@@ -77,6 +77,7 @@ def write_interest(nodes):
 
 def write_configs(n, base_gossip, base_api, base_prom, strategy):
     """生成 n 个节点配置；节点 0 为种子，其余 bootstrap 到它。"""
+    api_bind_host = os.environ.get("API_BIND_HOST", "127.0.0.1")
     schema_dir = os.path.join(WORK, "schema")
     os.makedirs(schema_dir, exist_ok=True)
     with open(os.path.join(schema_dir, "mission.sql"), "w") as f:
@@ -108,7 +109,7 @@ plaintext = true
 broadcast_strategy = "{strategy}"
 interest = [{interest}]
 [api]
-addr = "127.0.0.1:{api}"
+addr = "{api_bind_host}:{api}"
 [admin]
 path = "{WORK}/node{i}-admin.sock"
 [telemetry]
@@ -226,7 +227,8 @@ def run_once(n, rows, strategy):
     nodes = write_configs(n, 7400, 8400, 9400, strategy)
     procs = start(nodes)
     try:
-        if not wait_active(nodes):
+        active_timeout = int(os.environ.get("ACTIVE_TIMEOUT", max(30, n)))
+        if not wait_active(nodes, timeout=active_timeout):
             print(f"  [{strategy}] 节点未全部 ACTIVE，跳过")
             return None
         write_interest(nodes)

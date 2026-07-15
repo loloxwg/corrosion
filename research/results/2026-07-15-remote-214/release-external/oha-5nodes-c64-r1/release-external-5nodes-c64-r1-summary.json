@@ -1,0 +1,118 @@
+{
+  "host": "192.168.3.214",
+  "nodes": 5,
+  "connections_per_node": 64,
+  "duration": "10s",
+  "wall_s": 10.25546669960022,
+  "process_failures": 0,
+  "aggregate_qps": 46519.51329400606,
+  "per_node_qps_min": 9265.580403533844,
+  "per_node_qps_median": 9307.264640310435,
+  "per_node_qps_max": 9353.969653958682,
+  "nodes_at_or_above_10k": 0,
+  "nodes_success_rate_100pct": 5,
+  "per_node_p95_ms_max": 11.423,
+  "per_node_p99_ms_max": 13.16,
+  "results": [
+    {
+      "node": 0,
+      "returncode": 0,
+      "qps": 9353.969653958682,
+      "success_rate": 1.0,
+      "latency_ms": {
+        "min": 1.315,
+        "mean": 6.843,
+        "p50": 6.094,
+        "p95": 11.357,
+        "p99": 13.136,
+        "max": 120.811
+      },
+      "status_codes": {
+        "200": 93499
+      },
+      "errors": {
+        "aborted due to deadline": 64
+      }
+    },
+    {
+      "node": 1,
+      "returncode": 0,
+      "qps": 9265.580403533844,
+      "success_rate": 1.0,
+      "latency_ms": {
+        "min": 1.286,
+        "mean": 6.901,
+        "p50": 6.197,
+        "p95": 11.417,
+        "p99": 13.134,
+        "max": 121.92
+      },
+      "status_codes": {
+        "200": 92624
+      },
+      "errors": {
+        "aborted due to deadline": 64
+      }
+    },
+    {
+      "node": 2,
+      "returncode": 0,
+      "qps": 9279.735859348018,
+      "success_rate": 1.0,
+      "latency_ms": {
+        "min": 0.798,
+        "mean": 6.893,
+        "p50": 6.204,
+        "p95": 11.352,
+        "p99": 13.101,
+        "max": 121.6
+      },
+      "status_codes": {
+        "200": 92763
+      },
+      "errors": {
+        "aborted due to deadline": 64
+      }
+    },
+    {
+      "node": 3,
+      "returncode": 0,
+      "qps": 9312.962736855077,
+      "success_rate": 1.0,
+      "latency_ms": {
+        "min": 0.901,
+        "mean": 6.866,
+        "p50": 6.133,
+        "p95": 11.423,
+        "p99": 13.16,
+        "max": 121.745
+      },
+      "status_codes": {
+        "200": 93098
+      },
+      "errors": {
+        "aborted due to deadline": 64
+      }
+    },
+    {
+      "node": 4,
+      "returncode": 0,
+      "qps": 9307.264640310435,
+      "success_rate": 1.0,
+      "latency_ms": {
+        "min": 1.746,
+        "mean": 6.871,
+        "p50": 6.159,
+        "p95": 11.385,
+        "p99": 13.122,
+        "max": 122.055
+      },
+      "status_codes": {
+        "200": 93041
+      },
+      "errors": {
+        "aborted due to deadline": 64
+      }
+    }
+  ]
+}

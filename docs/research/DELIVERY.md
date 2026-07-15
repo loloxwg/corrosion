@@ -15,11 +15,12 @@ cargo build -p corrosion            # 构建 agent 二进制(target/debug/corros
 
 ---
 
-## 4.4.3 全局数据传输降 30%  —— ✅ localhost 54~77%(42 节点 54%,外推 100 节点≈44%,均>30%)
+## 4.4.3 全局数据传输降 30%  —— ✅ 远端 Linux 100 agent 实测 49.8%(单物理机)
 
 | 证据 | 命令 | 验什么 |
 |---|---|---|
 | 降量多规模均值 | `python3 research/harness/sweep.py --sizes 6 12 18 24 --rows 20 --repeats 3` | 总传输降幅(广播式 vs 智能),多规模×重复取均值+误差带 |
+| **远端 100 agent 聚合** | [`2026-07-15-remote-100-node-validation.md`](2026-07-15-remote-100-node-validation.md) | 100/100 收敛；总传输 2,914,903B→1,463,363B，**↓49.8%**；单台 20 核 Linux |
 | 部分复制 + 无死锁 | `SKIP_WRITE_INTEREST=1 python3 research/harness/verify_phase2.py --nodes 9` | 关心表本地收齐、非关心表**业务表+buffered 双层都=0**(直读 db 绕路由)、gap/needed 不增长 |
 | 泄漏定位(推送 vs 对账) | `python3 research/harness/debug_leak.py 6` | 非关心节点 battlefield 本地=0,确认两轴都按 interest 过滤 |
 | 多表事务残留边界 | `python3 research/harness/multitable_test.py` | 单事务多表=版本级边界(行级精度未做,诚实) |
@@ -27,15 +28,20 @@ cargo build -p corrosion            # 构建 agent 二进制(target/debug/corros
 **机制**:interest 模型(`node_interest` 复制表)+ 推送按表分组 + 对账 `handle_need` 版本级过滤(四个 serving 分支统一)。
 **诚实**:测量须**直读本地 db(`count_rows_local`)绕开查询路由**,否则路由会把本地裁剪掩盖成"到处都有"(假 FAIL)。
 
-## 4.4.2 任意节点查任意数据 + 1M QPS  —— 查询路由 ✅ correctness;1M=单节点微基准外推(未半实物验证)
+## 4.4.2 任意节点查任意数据 + 1M QPS  —— release 单节点 39,234 QPS ✅；100 节点 1M 未实证
 
 | 证据 | 命令 | 验什么 |
 |---|---|---|
 | 查询路由 correctness | `python3 research/harness/query_routing_test.py` | 本地有则本地答、没有则路由到持有者拿回正确结果 |
 | QPS 基准 + 外推 | `python3 research/harness/qps_bench.py --nodes 1` | 单节点本地点查 ≥25K QPS、100 节点外推 2.5M、500Kbps 路由上限 442K |
+| **100 agent 同步起压** | `python3 research/harness/qps_bench.py --nodes 100 --aggregate-concurrent --driver python --ab-parallel 1 --n 5000` | 1/2/4 连接阶梯均 500,000 查询、0 错误，峰值 **23,090 QPS**；单 agent 8 连接 **24,348 QPS** |
+| **release 承载密度** | `CORRO_BIN=target/release/corrosion python3 research/harness/qps_bench.py --nodes 4 --aggregate-concurrent --driver python --ab-parallel 4 --duration 10` | 单 agent **36,808 QPS**；4 agent 三轮每节点最小 **12,074--12,221**，全通过；5 agent 临界，10/20 失败 |
+| **独立起压器复核** | `python3 research/harness/external_oha_bench.py --host 192.168.3.214 --nodes 4 --connections 64 --duration 10s ...` | oha 经真实局域网：单 agent **39,234**；4 agent 每节点最小 **11,602**、4/4 通过；5 agent 最小 9,266，失败 |
 
 **论证**(技术报告 §3.1):1M 必须靠本地命中(部分复制让高频查询本地化);500Kbps 跨节点路由 ≈89 QPS/link,
-路由聚合上限 <1M → 本地命中是数学必然。**诚实**:无 100 节点半实物;单机数是下界;聚合 ×100 是外推。
+路由聚合上限 <1M → 本地命中是数学必然。**诚实**:已有 100 个真实 agent 同机同步起压，
+release 已确认单节点 39,234 QPS；独立起压器复核后 20 核机台稳定密度仍只有 4 agent。单节点 ×100 仍只是
+独立硬件外推，需多物理机共同时间窗复核。
 
 ## 4.2.3 数据需求模版 + gossip 多跳 + 智能推送模型  —— ✅
 
@@ -99,5 +105,6 @@ cargo build -p corrosion            # 构建 agent 二进制(target/debug/corros
 
 ## 未尽事项(诚实)
 
-① 100 节点半实物真聚合(本期单节点实测 + ×100 外推);② 高并发缓存/连接池调优;
-③ RL 链路优势的注入延迟端到端验证;④ 单事务多表的行级精度(scoped bookie,高风险);⑤ interest 动态变更/历史回填。
+① 100 agent 单机已测，仍需多物理机 + 500Kbps 半实物真聚合;② 高并发缓存/连接池调优;
+③ RL 链路优势的 dummynet/QUIC 重传高保真复核(应用层延迟注入已完成);
+④ 单事务多表的行级精度(scoped bookie,高风险);⑤ interest 动态变更/历史回填。

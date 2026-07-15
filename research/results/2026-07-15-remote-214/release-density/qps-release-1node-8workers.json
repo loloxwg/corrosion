@@ -1,0 +1,76 @@
+{
+  "mode": "aggregate_concurrent_python",
+  "elapsed_s": 6.520237445831299,
+  "complete_requests": 240000,
+  "request_errors": 0,
+  "process_failures": 0,
+  "aggregate_qps_wall": 36808.475457200344,
+  "sum_worker_qps": 36878.555009408374,
+  "per_process_qps_min": 4601.680329055907,
+  "per_process_qps_max": 4616.893324581612,
+  "samples": [
+    {
+      "node": 0,
+      "complete": 30000,
+      "errors": 0,
+      "elapsed_s": 6.500291585922241,
+      "qps": 4615.177581413634
+    },
+    {
+      "node": 0,
+      "complete": 30000,
+      "errors": 0,
+      "elapsed_s": 6.497875928878784,
+      "qps": 4616.893324581612
+    },
+    {
+      "node": 0,
+      "complete": 30000,
+      "errors": 0,
+      "elapsed_s": 6.498565673828125,
+      "qps": 4616.403296625889
+    },
+    {
+      "node": 0,
+      "complete": 30000,
+      "errors": 0,
+      "elapsed_s": 6.506288051605225,
+      "qps": 4610.924041796525
+    },
+    {
+      "node": 0,
+      "complete": 30000,
+      "errors": 0,
+      "elapsed_s": 6.509816408157349,
+      "qps": 4608.424895425233
+    },
+    {
+      "node": 0,
+      "complete": 30000,
+      "errors": 0,
+      "elapsed_s": 6.5146801471710205,
+      "qps": 4604.984331122903
+    },
+    {
+      "node": 0,
+      "complete": 30000,
+      "errors": 0,
+      "elapsed_s": 6.51597785949707,
+      "qps": 4604.06720938667
+    },
+    {
+      "node": 0,
+      "complete": 30000,
+      "errors": 0,
+      "elapsed_s": 6.519357681274414,
+      "qps": 4601.680329055907
+    }
+  ],
+  "nodes": 1,
+  "ab_parallel": 8,
+  "concurrency_per_ab": 16,
+  "requests_per_ab": 30000,
+  "cpu_count": 20,
+  "driver": "python",
+  "corrosion_bin": "/home/xwg/dev/corrosion-active-push-validation/target/release/corrosion"
+}

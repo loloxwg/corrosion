@@ -1,0 +1,317 @@
+{
+  "mode": "aggregate_concurrent_python",
+  "elapsed_s": 10.010109663009644,
+  "complete_requests": 521019,
+  "request_errors": 0,
+  "process_failures": 0,
+  "aggregate_qps_wall": 52049.27993199929,
+  "sum_worker_qps": 52098.944981670946,
+  "per_process_qps_min": 1270.8337360052908,
+  "per_process_qps_max": 1340.1623829035004,
+  "per_node_qps": {
+    "0": 5124.818980711958,
+    "9": 5343.597802695567,
+    "4": 5280.062035215396,
+    "3": 5136.307366341234,
+    "2": 5152.091409205805,
+    "1": 5154.488985337132,
+    "6": 5207.435458237275,
+    "5": 5258.683648044394,
+    "8": 5273.069104832358,
+    "7": 5118.725141378168
+  },
+  "per_node_qps_min": 5118.725141378168,
+  "per_node_qps_median": 5180.962221787204,
+  "per_node_qps_max": 5343.597802695567,
+  "nodes_at_or_above_10k": 0,
+  "samples": [
+    {
+      "node": 0,
+      "complete": 12935,
+      "errors": 0,
+      "elapsed_s": 10.000102996826172,
+      "qps": 1293.4866774977522
+    },
+    {
+      "node": 9,
+      "complete": 13388,
+      "errors": 0,
+      "elapsed_s": 10.000028133392334,
+      "qps": 1338.7962335120308
+    },
+    {
+      "node": 0,
+      "complete": 12825,
+      "errors": 0,
+      "elapsed_s": 10.000529050827026,
+      "qps": 1282.4321528208945
+    },
+    {
+      "node": 4,
+      "complete": 13327,
+      "errors": 0,
+      "elapsed_s": 10.00029182434082,
+      "qps": 1332.6611097050124
+    },
+    {
+      "node": 3,
+      "complete": 12916,
+      "errors": 0,
+      "elapsed_s": 10.000864744186401,
+      "qps": 1291.4883192984082
+    },
+    {
+      "node": 2,
+      "complete": 12873,
+      "errors": 0,
+      "elapsed_s": 10.000470638275146,
+      "qps": 1287.2394175860807
+    },
+    {
+      "node": 4,
+      "complete": 13113,
+      "errors": 0,
+      "elapsed_s": 10.000483512878418,
+      "qps": 1311.2366000217237
+    },
+    {
+      "node": 3,
+      "complete": 12902,
+      "errors": 0,
+      "elapsed_s": 10.00027084350586,
+      "qps": 1290.16505671729
+    },
+    {
+      "node": 3,
+      "complete": 12826,
+      "errors": 0,
+      "elapsed_s": 10.000858068466187,
+      "qps": 1282.489953581263
+    },
+    {
+      "node": 3,
+      "complete": 12771,
+      "errors": 0,
+      "elapsed_s": 10.001027822494507,
+      "qps": 1276.9687502793681
+    },
+    {
+      "node": 1,
+      "complete": 12709,
+      "errors": 0,
+      "elapsed_s": 10.000521421432495,
+      "qps": 1270.8337360052908
+    },
+    {
+      "node": 1,
+      "complete": 12891,
+      "errors": 0,
+      "elapsed_s": 10.001316547393799,
+      "qps": 1288.9303062164563
+    },
+    {
+      "node": 4,
+      "complete": 13286,
+      "errors": 0,
+      "elapsed_s": 10.000184535980225,
+      "qps": 1328.5754830020942
+    },
+    {
+      "node": 9,
+      "complete": 13396,
+      "errors": 0,
+      "elapsed_s": 10.00037693977356,
+      "qps": 1339.549507051214
+    },
+    {
+      "node": 1,
+      "complete": 13027,
+      "errors": 0,
+      "elapsed_s": 10.000304460525513,
+      "qps": 1302.6603391348583
+    },
+    {
+      "node": 1,
+      "complete": 12970,
+      "errors": 0,
+      "elapsed_s": 10.001431465148926,
+      "qps": 1296.81436554311
+    },
+    {
+      "node": 2,
+      "complete": 12959,
+      "errors": 0,
+      "elapsed_s": 10.001565933227539,
+      "qps": 1295.6971024854392
+    },
+    {
+      "node": 2,
+      "complete": 12827,
+      "errors": 0,
+      "elapsed_s": 10.000377416610718,
+      "qps": 1282.6515905983945
+    },
+    {
+      "node": 0,
+      "complete": 12732,
+      "errors": 0,
+      "elapsed_s": 10.000287294387817,
+      "qps": 1273.1634227293875
+    },
+    {
+      "node": 4,
+      "complete": 13128,
+      "errors": 0,
+      "elapsed_s": 10.000380516052246,
+      "qps": 1312.7500477534243
+    },
+    {
+      "node": 6,
+      "complete": 13098,
+      "errors": 0,
+      "elapsed_s": 10.000224113464355,
+      "qps": 1309.770646276295
+    },
+    {
+      "node": 6,
+      "complete": 12986,
+      "errors": 0,
+      "elapsed_s": 10.000229597091675,
+      "qps": 1298.570185206214
+    },
+    {
+      "node": 0,
+      "complete": 12808,
+      "errors": 0,
+      "elapsed_s": 10.0026695728302,
+      "qps": 1280.4581723652846
+    },
+    {
+      "node": 5,
+      "complete": 13318,
+      "errors": 0,
+      "elapsed_s": 10.000284433364868,
+      "qps": 1331.7621202418936
+    },
+    {
+      "node": 6,
+      "complete": 12973,
+      "errors": 0,
+      "elapsed_s": 10.000324010848999,
+      "qps": 1297.2579674344602
+    },
+    {
+      "node": 6,
+      "complete": 13070,
+      "errors": 0,
+      "elapsed_s": 10.000380516052246,
+      "qps": 1306.9502684443369
+    },
+    {
+      "node": 8,
+      "complete": 13148,
+      "errors": 0,
+      "elapsed_s": 10.00026822090149,
+      "qps": 1314.7647352617462
+    },
+    {
+      "node": 5,
+      "complete": 13017,
+      "errors": 0,
+      "elapsed_s": 10.000865697860718,
+      "qps": 1301.5873218639924
+    },
+    {
+      "node": 8,
+      "complete": 13271,
+      "errors": 0,
+      "elapsed_s": 10.000295877456665,
+      "qps": 1327.060735264481
+    },
+    {
+      "node": 5,
+      "complete": 13195,
+      "errors": 0,
+      "elapsed_s": 10.001730918884277,
+      "qps": 1319.2716447796558
+    },
+    {
+      "node": 8,
+      "complete": 13064,
+      "errors": 0,
+      "elapsed_s": 10.000092267990112,
+      "qps": 1306.3879462209895
+    },
+    {
+      "node": 7,
+      "complete": 12780,
+      "errors": 0,
+      "elapsed_s": 10.001172542572021,
+      "qps": 1277.8501666278964
+    },
+    {
+      "node": 7,
+      "complete": 12914,
+      "errors": 0,
+      "elapsed_s": 10.000336647033691,
+      "qps": 1291.3565268655793
+    },
+    {
+      "node": 7,
+      "complete": 12777,
+      "errors": 0,
+      "elapsed_s": 10.000357866287231,
+      "qps": 1277.6542770607502
+    },
+    {
+      "node": 8,
+      "complete": 13301,
+      "errors": 0,
+      "elapsed_s": 10.000171661376953,
+      "qps": 1330.0771677121936
+    },
+    {
+      "node": 9,
+      "complete": 13403,
+      "errors": 0,
+      "elapsed_s": 10.00102686882019,
+      "qps": 1340.1623829035004
+    },
+    {
+      "node": 7,
+      "complete": 12768,
+      "errors": 0,
+      "elapsed_s": 10.000235557556152,
+      "qps": 1276.7699247196765
+    },
+    {
+      "node": 5,
+      "complete": 13110,
+      "errors": 0,
+      "elapsed_s": 10.000214099884033,
+      "qps": 1310.9719321061366
+    },
+    {
+      "node": 9,
+      "complete": 13303,
+      "errors": 0,
+      "elapsed_s": 10.000190019607544,
+      "qps": 1330.2747221719367
+    },
+    {
+      "node": 2,
+      "complete": 12914,
+      "errors": 0,
+      "elapsed_s": 10.000031232833862,
+      "qps": 1291.3959666044325
+    }
+  ],
+  "nodes": 10,
+  "ab_parallel": 4,
+  "concurrency_per_ab": 16,
+  "requests_per_ab": 40000,
+  "requested_duration_s": 10.0,
+  "cpu_count": 20,
+  "driver": "python",
+  "corrosion_bin": "/home/xwg/dev/corrosion-active-push-validation/target/release/corrosion"
+}

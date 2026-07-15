@@ -1,0 +1,172 @@
+{
+  "mode": "aggregate_concurrent_python",
+  "elapsed_s": 10.004604816436768,
+  "complete_requests": 516044,
+  "request_errors": 0,
+  "process_failures": 0,
+  "aggregate_qps_wall": 51580.648058400155,
+  "sum_worker_qps": 51603.4918743281,
+  "per_process_qps_min": 2567.249625815343,
+  "per_process_qps_max": 2601.5263140377742,
+  "per_node_qps": {
+    "1": 10277.267506965887,
+    "2": 10360.52916650005,
+    "4": 10377.321433969124,
+    "3": 10284.064377131941,
+    "0": 10281.465573833155
+  },
+  "per_node_qps_min": 10277.267506965887,
+  "per_node_qps_median": 10284.064377131941,
+  "per_node_qps_max": 10377.321433969124,
+  "nodes_at_or_above_10k": 5,
+  "samples": [
+    {
+      "node": 1,
+      "complete": 25712,
+      "errors": 0,
+      "elapsed_s": 10.000022411346436,
+      "qps": 2571.194237607519
+    },
+    {
+      "node": 2,
+      "complete": 25828,
+      "errors": 0,
+      "elapsed_s": 10.000000715255737,
+      "qps": 2582.7998152637615
+    },
+    {
+      "node": 4,
+      "complete": 25937,
+      "errors": 0,
+      "elapsed_s": 10.000124454498291,
+      "qps": 2593.6677206385093
+    },
+    {
+      "node": 3,
+      "complete": 25721,
+      "errors": 0,
+      "elapsed_s": 10.000024557113647,
+      "qps": 2572.09368368031
+    },
+    {
+      "node": 3,
+      "complete": 25673,
+      "errors": 0,
+      "elapsed_s": 10.0001962184906,
+      "qps": 2567.249625815343
+    },
+    {
+      "node": 1,
+      "complete": 25700,
+      "errors": 0,
+      "elapsed_s": 10.00014328956604,
+      "qps": 2569.96317510919
+    },
+    {
+      "node": 0,
+      "complete": 25711,
+      "errors": 0,
+      "elapsed_s": 10.000391244888306,
+      "qps": 2570.9994109622626
+    },
+    {
+      "node": 0,
+      "complete": 25683,
+      "errors": 0,
+      "elapsed_s": 10.000271558761597,
+      "qps": 2568.230257457179
+    },
+    {
+      "node": 4,
+      "complete": 25901,
+      "errors": 0,
+      "elapsed_s": 10.000122308731079,
+      "qps": 2590.0683212030226
+    },
+    {
+      "node": 4,
+      "complete": 25967,
+      "errors": 0,
+      "elapsed_s": 10.00032353401184,
+      "qps": 2596.615990641134
+    },
+    {
+      "node": 1,
+      "complete": 25673,
+      "errors": 0,
+      "elapsed_s": 10.00008249282837,
+      "qps": 2567.278821790878
+    },
+    {
+      "node": 2,
+      "complete": 25944,
+      "errors": 0,
+      "elapsed_s": 10.000201940536499,
+      "qps": 2594.347609605185
+    },
+    {
+      "node": 4,
+      "complete": 26016,
+      "errors": 0,
+      "elapsed_s": 10.000283241271973,
+      "qps": 2601.5263140377742
+    },
+    {
+      "node": 0,
+      "complete": 25715,
+      "errors": 0,
+      "elapsed_s": 10.000081539154053,
+      "qps": 2571.4790323775037
+    },
+    {
+      "node": 0,
+      "complete": 25753,
+      "errors": 0,
+      "elapsed_s": 10.000122547149658,
+      "qps": 2575.268440819297
+    },
+    {
+      "node": 2,
+      "complete": 25952,
+      "errors": 0,
+      "elapsed_s": 10.000156879425049,
+      "qps": 2595.15928729031
+    },
+    {
+      "node": 3,
+      "complete": 25717,
+      "errors": 0,
+      "elapsed_s": 10.000007629394531,
+      "qps": 2571.698037950105
+    },
+    {
+      "node": 1,
+      "complete": 25735,
+      "errors": 0,
+      "elapsed_s": 10.000162124633789,
+      "qps": 2573.4582779019124
+    },
+    {
+      "node": 2,
+      "complete": 25929,
+      "errors": 0,
+      "elapsed_s": 10.000327110290527,
+      "qps": 2592.815186347111
+    },
+    {
+      "node": 3,
+      "complete": 25777,
+      "errors": 0,
+      "elapsed_s": 10.000470876693726,
+      "qps": 2577.578627829791
+    }
+  ],
+  "nodes": 5,
+  "ab_parallel": 4,
+  "concurrency_per_ab": 16,
+  "requests_per_ab": 40000,
+  "requested_duration_s": 10.0,
+  "cpu_count": 20,
+  "driver": "python",
+  "corrosion_bin": "/home/xwg/dev/corrosion-active-push-validation/target/release/corrosion"
+}

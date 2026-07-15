@@ -1,0 +1,98 @@
+{
+  "host": "192.168.3.214",
+  "nodes": 4,
+  "connections_per_node": 64,
+  "duration": "10s",
+  "wall_s": 10.228348731994629,
+  "process_failures": 0,
+  "aggregate_qps": 46475.90797065666,
+  "per_node_qps_min": 11602.057175323802,
+  "per_node_qps_median": 11622.650522388307,
+  "per_node_qps_max": 11628.549750556245,
+  "nodes_at_or_above_10k": 4,
+  "nodes_success_rate_100pct": 4,
+  "per_node_p95_ms_max": 8.778,
+  "per_node_p99_ms_max": 9.956,
+  "results": [
+    {
+      "node": 0,
+      "returncode": 0,
+      "qps": 11602.057175323802,
+      "success_rate": 1.0,
+      "latency_ms": {
+        "min": 1.474,
+        "mean": 5.512,
+        "p50": 5.195,
+        "p95": 8.76,
+        "p99": 9.798,
+        "max": 215.312
+      },
+      "status_codes": {
+        "200": 116004
+      },
+      "errors": {
+        "aborted due to deadline": 64
+      }
+    },
+    {
+      "node": 1,
+      "returncode": 0,
+      "qps": 11627.810362887414,
+      "success_rate": 1.0,
+      "latency_ms": {
+        "min": 1.207,
+        "mean": 5.499,
+        "p50": 5.19,
+        "p95": 8.778,
+        "p99": 9.956,
+        "max": 214.645
+      },
+      "status_codes": {
+        "200": 116267
+      },
+      "errors": {
+        "aborted due to deadline": 63
+      }
+    },
+    {
+      "node": 2,
+      "returncode": 0,
+      "qps": 11617.490681889201,
+      "success_rate": 1.0,
+      "latency_ms": {
+        "min": 1.494,
+        "mean": 5.505,
+        "p50": 5.207,
+        "p95": 8.756,
+        "p99": 9.844,
+        "max": 215.302
+      },
+      "status_codes": {
+        "200": 116142
+      },
+      "errors": {
+        "aborted due to deadline": 63
+      }
+    },
+    {
+      "node": 3,
+      "returncode": 0,
+      "qps": 11628.549750556245,
+      "success_rate": 1.0,
+      "latency_ms": {
+        "min": 1.57,
+        "mean": 5.503,
+        "p50": 5.194,
+        "p95": 8.732,
+        "p99": 9.828,
+        "max": 214.457
+      },
+      "status_codes": {
+        "200": 116258
+      },
+      "errors": {
+        "aborted due to deadline": 64
+      }
+    }
+  ]
+}

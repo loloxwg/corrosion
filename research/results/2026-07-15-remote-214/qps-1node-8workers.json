@@ -1,0 +1,75 @@
+{
+  "mode": "aggregate_concurrent_python",
+  "elapsed_s": 6.5712502002716064,
+  "complete_requests": 160000,
+  "request_errors": 0,
+  "process_failures": 0,
+  "aggregate_qps_wall": 24348.486988577424,
+  "sum_worker_qps": 24412.98430456186,
+  "per_process_qps_min": 3044.0656072697525,
+  "per_process_qps_max": 3057.989726001305,
+  "samples": [
+    {
+      "node": 0,
+      "complete": 20000,
+      "errors": 0,
+      "elapsed_s": 6.5402443408966064,
+      "qps": 3057.989726001305
+    },
+    {
+      "node": 0,
+      "complete": 20000,
+      "errors": 0,
+      "elapsed_s": 6.546753883361816,
+      "qps": 3054.949117734333
+    },
+    {
+      "node": 0,
+      "complete": 20000,
+      "errors": 0,
+      "elapsed_s": 6.55084228515625,
+      "qps": 3053.0425141387695
+    },
+    {
+      "node": 0,
+      "complete": 20000,
+      "errors": 0,
+      "elapsed_s": 6.554368734359741,
+      "qps": 3051.399884653222
+    },
+    {
+      "node": 0,
+      "complete": 20000,
+      "errors": 0,
+      "elapsed_s": 6.554360389709473,
+      "qps": 3051.403769527314
+    },
+    {
+      "node": 0,
+      "complete": 20000,
+      "errors": 0,
+      "elapsed_s": 6.556386470794678,
+      "qps": 3050.4608123834205
+    },
+    {
+      "node": 0,
+      "complete": 20000,
+      "errors": 0,
+      "elapsed_s": 6.558080434799194,
+      "qps": 3049.6728728537455
+    },
+    {
+      "node": 0,
+      "complete": 20000,
+      "errors": 0,
+      "elapsed_s": 6.570160627365112,
+      "qps": 3044.0656072697525
+    }
+  ],
+  "nodes": 1,
+  "ab_parallel": 8,
+  "concurrency_per_ab": 16,
+  "requests_per_ab": 20000,
+  "cpu_count": 20,
+  "driver": "python"
+}
