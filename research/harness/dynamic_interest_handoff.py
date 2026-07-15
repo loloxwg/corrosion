@@ -44,7 +44,7 @@ def cfg_path(i):
     return os.path.join(WORK, f"node{i}.toml")
 
 
-def write_config(i, interests, schema_dir):
+def write_config(i, interests, schema_dir, epoch):
     boot = "" if i == 0 else f'"[::1]:{BG}"'
     interest = ", ".join(f'"{table}"' for table in interests)
     with open(cfg_path(i), "w") as f:
@@ -60,6 +60,7 @@ plaintext = true
 broadcast_strategy = "scored_reduce"
 interest = [{interest}]
 interest_min_replicas = 2
+interest_epoch = {epoch}
 [api]
 addr = "127.0.0.1:{BA + i}"
 [admin]
@@ -133,7 +134,7 @@ def main():
     schema_dir = write_schema()
 
     specs = {0: ["*"], 1: ["flight", "target"], 2: ["flight"]}
-    nodes = {i: write_config(i, specs[i], schema_dir) for i in specs}
+    nodes = {i: write_config(i, specs[i], schema_dir, 1) for i in specs}
     procs = {i: start_one(nodes[i]) for i in nodes}
 
     try:
@@ -165,7 +166,7 @@ def main():
 
         print("阶段1:只有 node0 一个其它 ready holder，node1 摘除 target 必须失败")
         stop(procs[1])
-        write_config(1, ["flight"], schema_dir)
+        write_config(1, ["flight"], schema_dir, 2)
         procs[1] = start_one(nodes[1])
         wait_until(lambda: procs[1].poll() is not None, timeout=25, label="unsafe removal failure")
         unsafe_rc = procs[1].returncode
@@ -176,14 +177,14 @@ def main():
             raise RuntimeError("unsafe removal did not fail closed")
 
         # 先以旧配置恢复 node1，让它在线接收 node2 的 ready 声明。
-        write_config(1, ["flight", "target"], schema_dir)
+        write_config(1, ["flight", "target"], schema_dir, 1)
         procs[1] = start_one(nodes[1])
         wait_until(lambda: procs[1].poll() is None and self_interest(nodes[1], "target") == 1,
                    label="node1 recovery")
 
         print("阶段2:node2 扩大到 target，必须先回填历史再发布 active=1")
         stop(procs[2])
-        write_config(2, ["flight", "target"], schema_dir)
+        write_config(2, ["flight", "target"], schema_dir, 2)
         procs[2] = start_one(nodes[2])
         wait_until(
             lambda: self_interest(nodes[2], "target") == 1
@@ -211,7 +212,7 @@ def main():
 
         print("阶段3:已有 node0+node2 两个其它 ready holder，node1 摘除必须成功")
         stop(procs[1])
-        write_config(1, ["flight"], schema_dir)
+        write_config(1, ["flight"], schema_dir, 2)
         procs[1] = start_one(nodes[1])
         wait_until(
             lambda: procs[1].poll() is None and self_interest(nodes[1], "target") == 0,
@@ -232,6 +233,27 @@ def main():
             )
             == 0,
             label="target removal publication at writer",
+        )
+
+        print("阶段4:旧 epoch 配置重放必须被 fencing 拒绝")
+        stop(procs[1])
+        write_config(1, ["flight", "target"], schema_dir, 1)
+        procs[1] = start_one(nodes[1])
+        wait_until(
+            lambda: procs[1].poll() is not None,
+            timeout=25,
+            label="stale epoch rejection",
+        )
+        stale_log = open(nodes[1]["log"]).read()
+        if self_interest(nodes[1], "target") != 0 or "stale interest epoch 1" not in stale_log:
+            raise RuntimeError("stale placement replay was not fenced")
+        print("  epoch=1 重放已拒绝，target 声明保持删除")
+
+        write_config(1, ["flight"], schema_dir, 2)
+        procs[1] = start_one(nodes[1])
+        wait_until(
+            lambda: procs[1].poll() is None and self_interest(nodes[1], "target") == 0,
+            label="node1 restart after stale replay",
         )
         time.sleep(4)  # 等广播 selector 的 3 秒 interest 缓存刷新
 
@@ -259,7 +281,7 @@ def main():
         if node1_local != ROWS or node1_api != ROWS + 1:
             raise RuntimeError("post-removal storage/routing boundary is incorrect")
 
-        print("\n✅ PASS:摘除门禁、回填后发布、handoff 后查询路由均符合预期。")
+        print("\n✅ PASS:摘除门禁、回填后发布、epoch fencing 和 handoff 查询路由均符合预期。")
     finally:
         for proc in procs.values():
             stop(proc)

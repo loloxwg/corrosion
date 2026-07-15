@@ -129,6 +129,10 @@ async fn run(
         error!("could not execute schema: {e}");
     }
 
+    // stale/reused epoch 必须在改动 sync interest bookkeeping 之前被拒绝，避免旧配置即使
+    // 最终启动失败，仍提前改写本地回填状态。
+    validate_configured_interest_epoch(&agent).await?;
+
     // interest 扩大时，必须先重新打开此前因过滤而 Cleared 的版本，再启动 sync loop。
     // 失败时停止启动，避免节点继续使用已关闭的历史缺口。
     let (reopened, reopened_ranges) =
@@ -275,6 +279,64 @@ async fn wait_for_restored_live_members(
     }
 }
 
+const INTEREST_EPOCH_STATE_KEY: &str = "interest_epoch_v1";
+
+fn check_interest_epoch(
+    configured: u64,
+    applied: Option<u64>,
+    placement_changed: bool,
+) -> Result<(), ChangeError> {
+    if configured == 0 && applied.is_none() {
+        return Ok(());
+    }
+    if let Some(applied) = applied {
+        if configured < applied {
+            return Err(ChangeError::StaleInterestEpoch {
+                configured,
+                applied,
+            });
+        }
+        if configured == applied && placement_changed {
+            return Err(ChangeError::ReusedInterestEpoch { epoch: configured });
+        }
+    }
+    Ok(())
+}
+
+async fn validate_configured_interest_epoch(agent: &Agent) -> eyre::Result<()> {
+    let configured = agent.config().gossip.interest_epoch;
+    let interest = &agent.config().gossip.interest;
+    if configured > 0 && interest.is_empty() {
+        return Err(eyre::eyre!(
+            "interest_epoch requires an explicit interest; use interest = [\"*\"] for full replication"
+        ));
+    }
+    let desired = interest.iter().cloned().collect::<BTreeSet<_>>();
+    let conn = agent.pool().read().await?;
+    block_in_place(|| -> eyre::Result<()> {
+        let current = match conn
+            .prepare_cached("SELECT table_name FROM node_interest WHERE actor_id = crsql_site_id()")
+        {
+            Ok(mut stmt) => stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<BTreeSet<_>, _>>()?,
+            Err(e) if e.to_string().contains("no such table: node_interest") => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let applied = conn
+            .prepare_cached("SELECT value FROM __corro_state WHERE key = ?")?
+            .query_row([INTEREST_EPOCH_STATE_KEY], |row| row.get::<_, String>(0))
+            .optional()?
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .map_err(|_| eyre::eyre!("invalid persisted interest epoch: {value}"))
+            })
+            .transpose()?;
+        check_interest_epoch(configured, applied, current != desired).map_err(|e| eyre::eyre!(e))
+    })
+}
+
 async fn load_removal_candidate_actors(agent: &Agent) -> BTreeSet<ActorId> {
     let desired = agent
         .config()
@@ -341,6 +403,8 @@ async fn reconcile_own_interest(
     }
     let desired = interest.iter().cloned().collect::<BTreeSet<_>>();
     let required = agent.config().gossip.interest_min_replicas.max(1);
+    let configured_epoch = agent.config().gossip.interest_epoch;
+    let configured_epoch_value = configured_epoch.to_string();
     let desired_for_tx = desired.clone();
     let res = make_broadcastable_changes(agent, None, move |tx| {
         let current = tx
@@ -367,6 +431,32 @@ async fn reconcile_own_interest(
                 actor_id: None,
                 version: None,
             })?;
+
+        let applied_epoch = tx
+            .prepare_cached("SELECT value FROM __corro_state WHERE key = ?")
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: None,
+                version: None,
+            })?
+            .query_row([INTEREST_EPOCH_STATE_KEY], |row| row.get::<_, String>(0))
+            .optional()
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: None,
+                version: None,
+            })?
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .map_err(|_| ChangeError::InvalidInterestEpochState { value })
+            })
+            .transpose()?;
+        let placement_changed = current.len() != desired_for_tx.len()
+            || desired_for_tx
+                .iter()
+                .any(|table| !current.contains_key(table));
+        check_interest_epoch(configured_epoch, applied_epoch, placement_changed)?;
 
         let ready_holders = tx
             .prepare_cached(
@@ -427,6 +517,21 @@ async fn reconcile_own_interest(
                 "INSERT INTO node_interest (actor_id, table_name, active) \
                  VALUES (crsql_site_id(), ?, 0)",
                 &[table as &dyn rusqlite::ToSql],
+            )
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: None,
+                version: None,
+            })?;
+        }
+
+        if configured_epoch > 0 {
+            tx.execute(
+                "INSERT OR REPLACE INTO __corro_state (key, value) VALUES (?, ?)",
+                &[
+                    &INTEREST_EPOCH_STATE_KEY as &dyn rusqlite::ToSql,
+                    &configured_epoch_value as &dyn rusqlite::ToSql,
+                ],
             )
             .map_err(|source| ChangeError::Rusqlite {
                 source,
@@ -676,12 +781,38 @@ async fn reopen_filtered_versions_after_interest_expansion(
 
 #[cfg(test)]
 mod interest_backfill_tests {
-    use super::{count_ready_holders, sync_interest_expanded};
-    use corro_types::actor::ActorId;
+    use super::{check_interest_epoch, count_ready_holders, sync_interest_expanded};
+    use corro_types::{actor::ActorId, agent::ChangeError};
     use std::collections::BTreeSet;
 
     fn actor(byte: u8) -> ActorId {
         ActorId::from_bytes([byte; 16])
+    }
+
+    #[test]
+    fn interest_epoch_fences_stale_and_conflicting_placement() {
+        assert!(check_interest_epoch(0, None, true).is_ok());
+        assert!(check_interest_epoch(1, None, true).is_ok());
+        assert!(check_interest_epoch(1, Some(1), false).is_ok());
+        assert!(check_interest_epoch(2, Some(1), true).is_ok());
+        assert!(matches!(
+            check_interest_epoch(0, Some(1), false),
+            Err(ChangeError::StaleInterestEpoch {
+                configured: 0,
+                applied: 1
+            })
+        ));
+        assert!(matches!(
+            check_interest_epoch(1, Some(2), false),
+            Err(ChangeError::StaleInterestEpoch {
+                configured: 1,
+                applied: 2
+            })
+        ));
+        assert!(matches!(
+            check_interest_epoch(2, Some(2), true),
+            Err(ChangeError::ReusedInterestEpoch { epoch: 2 })
+        ));
     }
 
     #[test]

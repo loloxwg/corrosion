@@ -2527,6 +2527,7 @@ mod tests {
             interest_routing: Default::default(),
             interest: Default::default(),
             interest_min_replicas: 1,
+            interest_epoch: 0,
             graphrl: None,
             critical_tables: Default::default(),
         };

@@ -48,7 +48,7 @@ release 已确认单节点 39,234 QPS；独立起压器复核后 20 核机台稳
 | 证据 | 命令/位置 | 验什么 |
 |---|---|---|
 | 数据需求模版(节点自描述) | `node_interest` 复制表;`run_root.rs::reconcile_own_interest` | 新 interest 先 active=0，历史回填后 ready；摘除受在线最小副本数门禁保护 |
-| 动态 handoff | `dynamic_interest_hole.py` + `dynamic_interest_handoff.py` | 15/15 历史回填后发布；1<2 摘除拒绝，补齐 holder 后摘除成功并路由查询 |
+| 动态 handoff + fencing | `dynamic_interest_hole.py` + `dynamic_interest_handoff.py` | 15/15 历史回填后发布；1<2 摘除拒绝，补齐 holder 后摘除成功；旧 epoch placement 重放被拒绝 |
 | interest wildcard | `python3 research/harness/wildcard_test.py` | `interest=["*"]`=全量节点;与精确表名两语义;不破坏共存节点的部分复制 |
 | **多跳路由(链路通断)** | `python3 research/harness/multihop_test.py --nodes 6 --rows 20` | 直连 drop_p=1.0 + sync 拉长 60s 隔离 → 0.4s 收齐=**必经中继 rebroadcast ≥2 跳**;快路径全断 → sync 兜底收敛(6/9 节点复跑一致,报告 §5) |
 | 控制面豁免(此实验修复) | `selector.rs::CONTROL_TABLE` + 单测 `control_table_broadcast_bypasses_interest_filter` | `node_interest` 自身广播不被 interest 过滤(鸡生蛋),与对账侧恒豁免口径对齐 |
@@ -79,7 +79,7 @@ release 已确认单节点 39,234 QPS；独立起压器复核后 20 核机台稳
 - **回归**:`query_routing_test.py` 正确性 PASS;`cargo test -p corro-agent --lib` 43 passed(`test_lagging_subscribers` 已知 flaky,隔离通过)。resolve 改进值得留(生产查询延迟收益),RL 集群解锁作诚实负结果记录。
 
 **★RL 归位:瞬态选路层(BroadcastStrategy::Rl)+ 动态 placement 正确性边界**:厘清 RL 的**安全落点**——不是动态改 placement(谁长期持有),而是在 interest 圈定的合法集内优化"这条广播发给谁/扇出/路径"(瞬态层,推错自愈不丢数据)。
-- **重新关心历史回填已修复(`dynamic_interest_hole.py`)**:旧实现把过滤版本标为 `Cleared` 后永久不重取，实测 NodeR 重新关心 target 仍为 0/15。现持久记录 filtered version ranges，启动检测 interest 扩大后原子重开对应 gaps；同一场景翻转为 NodeR 本地/API 15/15。协议见 [`dynamic-interest-backfill.md`](dynamic-interest-backfill.md)。完整动态 placement 仍缺“摘除 interest 前 handoff/min_replicas 门禁”和在线统一 interest 状态，故 RL 仍不动态改 placement。
+- **动态 placement 串行协议已完成**:filtered version ranges 修复重新关心历史；新增 interest 先 active=0、回填后 ready；摘除受在线 `interest_min_replicas` 门禁保护；`interest_epoch` 阻止旧配置和同 epoch 冲突重放。协议和三节点证据见 [`dynamic-interest-backfill.md`](dynamic-interest-backfill.md)。剩余边界是多控制器并发分配 epoch 仍需外部 lease/共识，因此 RL 仍不自行并发改 placement。
 - **RL 归位实现(selector.rs)**:`BroadcastStrategy::Rl` 从占位回退→真实现:合法集先由 `interest_pool`(同 scored_reduce 的正确性/降量边界)圈定,**RL 仅在集内**用方差感知打分(`rl_score`=基础分−方差惩罚,`VARIANCE_WEIGHT=0.8`,偏好低 RTT 方差=稳定链路做广播目标,不稳链路留 anti-entropy 兜底)。方差信号来自 `members.rtts` 最近 20 样本(`Rtt::variance()`)。**安全:只在合法集内重排,不改 placement/不碰 durability,推错自愈。** 权重可离线 RL 学习/蒸馏,现手设为 RL 学到的方向(sim-to-real 已证方差感知降查询延迟)。
 - **回归**:selector 单测 11 passed(新增 rl_prefers_low_variance / rl_stays_within_interest_set / rl_falls_back_to_full_without_interest);`cargo test -p corro-agent --lib` 46 passed(flaky 隔离通过)。
 - **端到端实测**(`rl_selector_e2e.py`,8 节点全关心 flight,注入 jitter 产 RTT 方差):埋点 `corro.broadcast.target.rttvar_milli`(所选目标平均方差,按策略)。scored 961 vs **rl 914 ms²(↓5%)**,方向对但边际薄。**★真根因(与查询侧 resolve 吸收同构)**:corrosion 的 RTT-ring 机制已吃掉大部分链路信号——注入 jitter 同时抬高均值 RTT→不稳 peer 落 ring4-5 非 ring0,ring0-flood 总发低 RTT peer→高方差⟹高均值⟹高 ring⟹已被现有机制降优先级;Rl 的"纯方差"信号(同均值不同方差)在 ring0 桶空间极小。机制present(方向对+单测证逻辑),价值被 ring 吸收。

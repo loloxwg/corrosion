@@ -250,6 +250,11 @@ pub struct GossipConfig {
     /// 这是单次/串行 placement 变更的 fail-closed 门禁；并发摘除仍须由控制器串行化。
     #[serde(default = "default_interest_min_replicas")]
     pub interest_min_replicas: usize,
+    /// 本节点 placement 配置的单调 fencing token。首次启用前 0=兼容模式；一旦写入非零
+    /// epoch，后续每次改变 `interest` 必须严格递增，回到 0、旧 epoch 或同 epoch 不同
+    /// placement 都会拒绝启动。epoch 模式的全量节点须显式使用 `interest = ["*"]`。
+    #[serde(default)]
+    pub interest_epoch: u64,
     /// 内嵌 GNN(4.3.3 活模型)配置。设置=在 agent 里加载训练好的权重、周期跑推理算
     /// 适配度评分 score(表,平台)驱动 selector 推送目标(仅 broadcast_strategy=rl 时生效)。
     /// 空=不启用(Rl 回退手设方差启发式)。
@@ -623,6 +628,7 @@ impl ConfigBuilder {
                 interest_routing: Default::default(),
                 interest: Default::default(),
                 interest_min_replicas: default_interest_min_replicas(),
+                interest_epoch: 0,
                 graphrl: None,
                 critical_tables: Default::default(),
             },

@@ -239,6 +239,7 @@ RTT 均匀,真实异构网络多跳绕行代价不会是 0;debug 构建 sync 默
 - **旧故障**:节点先不关心表 T 时，过滤版本被 `Empty→Cleared`，扩大 interest 后 `generate_sync` 不再请求；实测 NodeR 本地/API 均为 0/15。
 - **修复**:部分同步收到 Empty 时，在同一事务持久记录 `__corro_filtered_version_ranges`；启动持久化有效 interest，检测集合扩大后在 bookie writer lock + SQLite 事务内重开对应 gaps，提交后才启动 sync。失败则阻止 agent 启动，避免假 holder。回归用例翻转为 NodeR 本地/API 15/15，详见 [`dynamic-interest-backfill.md`](dynamic-interest-backfill.md)。
 - **动态摘除**:新增 `interest_min_replicas` fail-closed 门禁；只统计其它在线 active=1 holder，wildcard 摘除要求其它 wildcard。三节点 handoff 回归证明 1<2 时拒绝，扩容节点回填/ready 后摘除成功；查询自动路由到剩余 holder。
+- **旧配置 fencing**:`interest_epoch` 以本地 `__corro_state` + 同一 Immediate Transaction 持久化；旧 epoch、回到 0、同 epoch 不同 placement 均拒绝，门禁失败不推进 epoch。三节点回归已验证旧 target placement 重放不复活 holder。
 - **剩余边界**:CRDT 控制面不是跨节点共识事务，并发摘除必须由控制器串行化；摘除生效还需等待声明传播和 selector 缓存刷新。
 
 **未尽事项(诚实)**:① 100 agent 单机已测,仍需多物理机 + 500Kbps 半实物真聚合,尤其补齐 1M QPS;

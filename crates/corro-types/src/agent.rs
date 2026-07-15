@@ -539,6 +539,12 @@ pub enum ChangeError {
         ready: usize,
         required: usize,
     },
+    #[error("stale interest epoch {configured}; already applied {applied}")]
+    StaleInterestEpoch { configured: u64, applied: u64 },
+    #[error("interest epoch {epoch} was reused for a different placement")]
+    ReusedInterestEpoch { epoch: u64 },
+    #[error("invalid persisted interest epoch: {value}")]
+    InvalidInterestEpochState { value: String },
 }
 
 impl ChangeError {
