@@ -9,7 +9,7 @@
 
 对照:
   NodeA  写入方 + wildcard(持有全部,数据的源,证明集群里 target 历史是有的)。
-  NodeR  先 interest=[flight],后"重新关心"target(改 node_interest + 重启带新 gossip.interest)。
+  NodeR  先 interest=[flight],后"重新关心"target(重启带新 gossip.interest)。
   NodeS  从头就 interest=[flight,target](对照组,应拿到全部 target)。
 
 判定:NodeR 在旧 interest 下应持久记录 filtered version ranges；重新关心并重启后，
@@ -89,7 +89,8 @@ def local_count(nd, table, prefix):
 
 def local_scalar(nd, sql):
     r = H.sh(["sqlite3", nd["db"], sql])
-    return int(r.stdout.strip())
+    value = r.stdout.strip()
+    return int(value) if value else 0
 
 
 def main():
@@ -140,12 +141,9 @@ def main():
         print(f"  预期:NodeR=0(被 Empty→Cleared),NodeS={ROWS}(对照拿到)")
         print(f"  NodeR 持久化 filtered version ranges={tracked}(预期 >0)")
 
-        print("\n阶段2:NodeR 重新关心 target(改 node_interest + 重启带新 gossip.interest)")
-        # ① 动态改 node_interest(推送/查询侧看的)
-        H.sh([H.BIN, "-c", nodes[1]["cfg"], "exec",
-              "INSERT OR IGNORE INTO node_interest (actor_id, table_name) "
-              "VALUES (crsql_site_id(), 'target')"])
-        # ② 重启 NodeR,gossip.interest 改为 [flight,target](对账侧看的,静态配置)
+        print("\n阶段2:NodeR 重新关心 target(重启带新 gossip.interest)")
+        # 重启 NodeR,gossip.interest 改为 [flight,target]。corrosion 自己先发布 active=0，
+        # 历史回填完成后再原子切换 active=1；测试不再提前手写 holder 声明。
         procs[1].send_signal(signal.SIGTERM)
         try:
             procs[1].wait(timeout=5)
@@ -159,8 +157,19 @@ def main():
                "considered ACTIVE" in open(nodes[1]["log"]).read():
                 break
             time.sleep(0.5)
-        print("  NodeR 已带 interest=[flight,target] 重启,等对账充分回填 ...")
-        time.sleep(20)  # 给对账每一次机会去 backfill
+        print("  NodeR 已带 interest=[flight,target] 重启,等对账回填并发布 ready ...")
+        t0 = time.time()
+        ready = 0
+        while time.time() - t0 < 40:
+            ready = local_scalar(
+                nodes[1],
+                "SELECT active FROM node_interest WHERE actor_id="
+                "(SELECT site_id FROM crsql_site_id WHERE ordinal=0) "
+                "AND table_name='target'",
+            )
+            if ready == 1 and local_count(nodes[1], "target", prefix) == ROWS:
+                break
+            time.sleep(1)
 
         r2 = local_count(nodes[1], "target", prefix)
         s2 = local_count(nodes[2], "target", prefix)
@@ -170,7 +179,8 @@ def main():
         print(f"  NodeR 重新关心后 直读本地 target = {r2} / {ROWS}")
         print(f"  NodeS 对照            直读本地 target = {s2} / {ROWS}(证明数据在集群有源)")
         print(f"  NodeR 经 API 查询(它现在是 holder)target = {rq}")
-        if tracked > 0 and r1 == 0 and r2 == ROWS and s2 == ROWS and rq == ROWS:
+        print(f"  NodeR target readiness active = {ready}(预期 1)")
+        if tracked > 0 and r1 == 0 and r2 == ROWS and s2 == ROWS and rq == ROWS and ready == 1:
             print(f"\n  ✅ PASS:NodeR interest 扩大后，本地历史已完整回填({r2}/{ROWS})。")
         else:
             print(f"\n  ❌ FAIL:tracked={tracked},阶段1本地={r1},"

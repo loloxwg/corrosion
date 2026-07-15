@@ -476,6 +476,29 @@ async fn resolve_table_holder(agent: &Agent, table: &str) -> Option<SocketAddr> 
     })
 }
 
+/// `Some` means the replicated readiness table was available; `None` preserves the
+/// legacy configuration-only behavior for deployments without `node_interest`.
+async fn local_table_ready(agent: &Agent, table: &str) -> Option<bool> {
+    let conn = match agent.pool().read().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            warn!("query routing: could not acquire connection for local readiness: {e}");
+            return None;
+        }
+    };
+
+    block_in_place(|| {
+        conn.prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM node_interest \
+             WHERE actor_id = crsql_site_id() AND active = 1 \
+             AND (table_name = ? OR table_name = '*'))",
+        )
+        .and_then(|mut stmt| stmt.query_row([table], |row| row.get(0)))
+        .map_err(|e| warn!("query routing: could not read local node_interest readiness: {e}"))
+        .ok()
+    })
+}
+
 async fn send_query_error(data_tx: &mpsc::Sender<QueryEvent>, message: impl ToString) {
     let _ = data_tx
         .send(QueryEvent::Error(message.to_string().to_compact_string()))
@@ -812,14 +835,25 @@ pub async fn api_v1_queries(
 
     let route_table = {
         let my_interest = agent.config().gossip.interest.clone();
-        // 空 interest 或含 wildcard "*" → 本节点存全部 → 一律本地查,不路由。
-        if my_interest.is_empty() || my_interest.iter().any(|t| t == "*") {
+        // 空 interest 保留 corrosion 原生全量复制语义。非空配置还必须通过 active=1
+        // readiness 门禁；新增 interest 回填期间即使配置已包含，也不会在本地查询。
+        if my_interest.is_empty() {
             None
         } else {
             let my_interest = my_interest.into_iter().collect::<BTreeSet<_>>();
-            referenced_tables(stmt.query())
-                .into_iter()
-                .find(|table| !my_interest.contains(table))
+            let wildcard = my_interest.contains("*");
+            let mut route = None;
+            for table in referenced_tables(stmt.query()) {
+                let configured_local = wildcard || my_interest.contains(&table);
+                let ready = local_table_ready(&agent, &table)
+                    .await
+                    .unwrap_or(configured_local);
+                if !ready {
+                    route = Some(table);
+                    break;
+                }
+            }
+            route
         }
     };
 

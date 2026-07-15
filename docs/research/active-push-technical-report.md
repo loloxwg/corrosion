@@ -225,8 +225,8 @@ RTT 均匀,真实异构网络多跳绕行代价不会是 0;debug 构建 sync 默
 | 4.2.3 数据需求模版 + gossip 多跳 + 模型 | ✅(多跳已实验验证,§5) | `node_interest` 模版(节点启动**自写**);`multihop_test.py` 直连断→中继多跳 0.4s 收齐 / 快路径全断→sync 兜底;GNN+DRL 模型 |
 | 4.3.3 GNN+DRL 适配度评分函数 | ✅ 核心验证 + 端到端;集群级归因诚实(§4.4);「优先/及时」传输优先级 ✅(§4.5) | 监督省 65% + RL 鲁棒省 69%;3 张证据图;`rl_e2e_latency.py` 受控 16 vs 207ms(13×);`rl_placement_e2e.py` 集群逐层证「三处吸收」;RL 安全归位瞬态选路 `BroadcastStrategy::Rl`;`critical_latency_test.py` critical 表多跳时延 13 vs 182ms(↓93%) |
 
-**生产侧 interest 写入(本轮收口)**:corrosion 启动时从 `gossip.interest` 配置**自写** `node_interest`
-(`run_root.rs::write_own_interest`),不再依赖外部/harness 写入,且启动即可见(减轻传播竞态)。
+**生产侧 interest 写入(本轮收口)**:corrosion 启动时从 `gossip.interest` 配置协调 `node_interest`
+(`run_root.rs::reconcile_own_interest`),不再依赖外部/harness 写入。新增项先 active=0，回填完成才 ready。
 `SKIP_WRITE_INTEREST=1 verify_phase2.py` 验证:全靠 corrosion 自写,部分复制仍 PASS。
 
 **interest wildcard(本轮收口)**:`interest=["*"]` = 关心全部(= 全量节点),与精确表名两种语义。
@@ -238,12 +238,13 @@ RTT 均匀,真实异构网络多跳绕行代价不会是 0;debug 构建 sync 默
 **动态 interest 安全边界(2026-07-15 修复,★正确性)**:
 - **旧故障**:节点先不关心表 T 时，过滤版本被 `Empty→Cleared`，扩大 interest 后 `generate_sync` 不再请求；实测 NodeR 本地/API 均为 0/15。
 - **修复**:部分同步收到 Empty 时，在同一事务持久记录 `__corro_filtered_version_ranges`；启动持久化有效 interest，检测集合扩大后在 bookie writer lock + SQLite 事务内重开对应 gaps，提交后才启动 sync。失败则阻止 agent 启动，避免假 holder。回归用例翻转为 NodeR 本地/API 15/15，详见 [`dynamic-interest-backfill.md`](dynamic-interest-backfill.md)。
-- **剩余边界**:静态 interest 与“扩大 interest 后回填”安全；完整动态 placement 仍缺失去 interest 前的 handoff/min_replicas 门禁、路由发布门禁，以及推送侧 `node_interest` 与对账侧配置的在线统一。
+- **动态摘除**:新增 `interest_min_replicas` fail-closed 门禁；只统计其它在线 active=1 holder，wildcard 摘除要求其它 wildcard。三节点 handoff 回归证明 1<2 时拒绝，扩容节点回填/ready 后摘除成功；查询自动路由到剩余 holder。
+- **剩余边界**:CRDT 控制面不是跨节点共识事务，并发摘除必须由控制器串行化；摘除生效还需等待声明传播和 selector 缓存刷新。
 
 **未尽事项(诚实)**:① 100 agent 单机已测,仍需多物理机 + 500Kbps 半实物真聚合,尤其补齐 1M QPS;
 ② 高并发缓存/连接池调优;
 ③ RL 链路优势的 **dummynet/QUIC 重传**高保真复核(本期已用应用层延迟注入端到端验证查询延迟优势,§4.3);
-④ 单事务多表的行级精度(scoped bookie,高风险);⑤ **动态 interest 摘除协议**(历史回填已完成；仍需 handoff/min_replicas、路由发布门禁和在线统一 interest)。
+④ 单事务多表的行级精度(scoped bookie,高风险);⑤ 动态 placement 的**并发控制器/epoch**(串行 handoff 已完成)。
 
 **方法学**:全程"设计 → Codex 对抗复核 → 实现 → 实测(重复均值)→ 诚实记录(含失败)",
 多处靠 Codex 复核纠偏(payload 混表根因、一进程约束下路线选择、RL 奖励 hacking 防护、稳定化、1M QPS 可达性骨架)。

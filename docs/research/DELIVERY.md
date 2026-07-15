@@ -47,7 +47,8 @@ release 已确认单节点 39,234 QPS；独立起压器复核后 20 核机台稳
 
 | 证据 | 命令/位置 | 验什么 |
 |---|---|---|
-| 数据需求模版(节点自描述) | `node_interest` 复制表;corrosion 启动从 `gossip.interest` **自写**(`run_root.rs::write_own_interest`) | 每节点自声明关心的表,经 crsqlite 复制到全集群 |
+| 数据需求模版(节点自描述) | `node_interest` 复制表;`run_root.rs::reconcile_own_interest` | 新 interest 先 active=0，历史回填后 ready；摘除受在线最小副本数门禁保护 |
+| 动态 handoff | `dynamic_interest_hole.py` + `dynamic_interest_handoff.py` | 15/15 历史回填后发布；1<2 摘除拒绝，补齐 holder 后摘除成功并路由查询 |
 | interest wildcard | `python3 research/harness/wildcard_test.py` | `interest=["*"]`=全量节点;与精确表名两语义;不破坏共存节点的部分复制 |
 | **多跳路由(链路通断)** | `python3 research/harness/multihop_test.py --nodes 6 --rows 20` | 直连 drop_p=1.0 + sync 拉长 60s 隔离 → 0.4s 收齐=**必经中继 rebroadcast ≥2 跳**;快路径全断 → sync 兜底收敛(6/9 节点复跑一致,报告 §5) |
 | 控制面豁免(此实验修复) | `selector.rs::CONTROL_TABLE` + 单测 `control_table_broadcast_bypasses_interest_filter` | `node_interest` 自身广播不被 interest 过滤(鸡生蛋),与对账侧恒豁免口径对齐 |

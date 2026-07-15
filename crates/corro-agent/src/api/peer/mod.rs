@@ -2526,6 +2526,7 @@ mod tests {
             broadcast_strategy: Default::default(),
             interest_routing: Default::default(),
             interest: Default::default(),
+            interest_min_replicas: 1,
             graphrl: None,
             critical_tables: Default::default(),
         };

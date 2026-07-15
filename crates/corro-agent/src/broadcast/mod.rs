@@ -86,7 +86,9 @@ async fn load_interest_routing(agent: &Agent) -> HashMap<String, Vec<SocketAddr>
     tokio::task::block_in_place(|| {
         let mut map: HashMap<String, Vec<SocketAddr>> = HashMap::new();
         let mut stmt =
-            match conn.prepare_cached("SELECT actor_id, table_name FROM node_interest") {
+            match conn.prepare_cached(
+                "SELECT actor_id, table_name FROM node_interest WHERE active = 1",
+            ) {
                 Ok(s) => s,
                 // 表未定义(未启用 node_interest) → 无信号，回退静态配置
                 Err(_) => return map,

@@ -531,6 +531,14 @@ pub enum ChangeError {
     },
     #[error("non-contiguous empties range delete")]
     NonContiguousDelete,
+    #[error(
+        "unsafe interest removal for {table}: only {ready} other ready holders, require {required}"
+    )]
+    InterestRemovalUnsafe {
+        table: String,
+        ready: usize,
+        required: usize,
+    },
 }
 
 impl ChangeError {

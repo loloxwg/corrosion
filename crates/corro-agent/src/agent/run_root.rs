@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use crate::agent::util::execute_schema_from_paths;
@@ -116,24 +116,35 @@ async fn run(
     // Load existing cluster members into the SWIM runtime
     util::initialise_foca(&agent, member_states).await;
 
+    // placement 摘除门禁依赖实时成员视图，因此先消费 SWIM 通知，再协调 node_interest。
+    // 此时数据同步和 HTTP API 尚未启动，不会在门禁完成前对外提供服务。
+    spawn_counted(handlers::handle_notifications(
+        agent.clone(),
+        notifications_rx,
+        tripwire.clone(),
+    ));
+
     // Load schema from paths
     if let Err(e) = execute_schema_from_paths(&agent).await {
         error!("could not execute schema: {e}");
     }
 
-    // 自写 interest:从 gossip.interest 写入复制表 node_interest(4.2.3 数据需求模版的节点自描述)。
-    // 让 interest 配置化、不依赖外部写,且启动即可见(减轻传播竞态)。schema 须含 node_interest 表。
-    write_own_interest(&agent).await;
-
     // interest 扩大时，必须先重新打开此前因过滤而 Cleared 的版本，再启动 sync loop。
-    // 失败时停止启动，避免节点以 holder 身份对外提供不完整历史。
-    let reopened = reopen_filtered_versions_after_interest_expansion(&agent).await?;
+    // 失败时停止启动，避免节点继续使用已关闭的历史缺口。
+    let (reopened, reopened_ranges) =
+        reopen_filtered_versions_after_interest_expansion(&agent).await?;
     if reopened > 0 {
         info!(
             reopened_versions = reopened,
             "reopened filtered versions after interest expansion"
         );
     }
+
+    // 新 interest 先以 active=0 发布；只有历史缺口回填完成后才切换为 active=1。
+    // 摘除则在同一事务内检查其它在线 ready holder 的最小副本数，不满足即停止启动。
+    let ready_holder_actors = load_removal_candidate_actors(&agent).await;
+    let live_actors = wait_for_restored_live_members(&agent, &ready_holder_actors).await;
+    let has_pending_interest = reconcile_own_interest(&agent, live_actors).await?;
 
     let mut handles = vec![];
     // Setup client http API
@@ -168,12 +179,6 @@ async fn run(
         to_send_rx,
         tripwire.clone(),
     ));
-    spawn_counted(handlers::handle_notifications(
-        agent.clone(),
-        notifications_rx,
-        tripwire.clone(),
-    ));
-
     spawn_handle_db_maintenance(&agent);
 
     let bookie = agent.bookie().clone();
@@ -238,66 +243,325 @@ async fn run(
     );
     handles.push(changes_handle);
 
+    if has_pending_interest {
+        spawn_counted(activate_pending_interest_when_synced(
+            agent.clone(),
+            bookie.clone(),
+            reopened_ranges,
+            tripwire.clone(),
+        ));
+    }
+
     Ok((bookie, handles))
 }
 
-/// 启动时把本节点 `gossip.interest` 写入复制表 `node_interest`(走正常本地写路径→复制到全集群)。
-/// 空 interest = 关心全部(全量节点),不写。`node_interest` 表须在 schema 中(否则只 warn,不致命)。
-/// 对接 4.2.3「数据需求模版」的节点自描述;让 interest 配置化、不依赖外部写、启动即可见。
-async fn write_own_interest(agent: &Agent) {
+async fn wait_for_restored_live_members(
+    agent: &Agent,
+    expected: &BTreeSet<ActorId>,
+) -> BTreeSet<ActorId> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let live = agent
+            .members()
+            .read()
+            .states
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if expected.is_subset(&live) || tokio::time::Instant::now() >= deadline {
+            return live;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn load_removal_candidate_actors(agent: &Agent) -> BTreeSet<ActorId> {
+    let desired = agent
+        .config()
+        .gossip
+        .interest
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let Ok(conn) = agent.pool().read().await else {
+        return BTreeSet::new();
+    };
+    block_in_place(|| {
+        let removed = conn
+            .prepare_cached(
+                "SELECT table_name FROM node_interest \
+                 WHERE actor_id = crsql_site_id() AND active = 1",
+            )
+            .and_then(|mut stmt| {
+                stmt.query_map([], |row| row.get::<_, String>(0))?
+                    .filter(|row| row.as_ref().is_ok_and(|table| !desired.contains(table)))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap_or_default();
+        if removed.is_empty() {
+            return BTreeSet::new();
+        }
+
+        conn.prepare_cached(
+            "SELECT actor_id, table_name FROM node_interest \
+             WHERE active = 1 AND actor_id != crsql_site_id()",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| {
+                Ok((row.get::<_, ActorId>(0)?, row.get::<_, String>(1)?))
+            })?
+            .filter(|row| {
+                row.as_ref().is_ok_and(|(_, holder_table)| {
+                    removed.iter().any(|removed_table| {
+                        if removed_table == "*" {
+                            holder_table == "*"
+                        } else {
+                            holder_table == removed_table || holder_table == "*"
+                        }
+                    })
+                })
+            })
+            .map(|row| row.map(|(actor_id, _)| actor_id))
+            .collect::<Result<BTreeSet<_>, _>>()
+        })
+        .unwrap_or_default()
+    })
+}
+
+async fn reconcile_own_interest(
+    agent: &Agent,
+    live_actors: BTreeSet<ActorId>,
+) -> eyre::Result<bool> {
+    // 新增项先写 active=0，等待历史回填完成后再发布为 ready；删除 active=1 项前，必须有
+    // `interest_min_replicas` 个其它在线 ready holder。控制器必须串行提交 placement 变更，
+    // 因为复制表本身不提供跨节点的线性一致 compare-and-swap。
     let interest = agent.config().gossip.interest.clone();
     if interest.is_empty() {
-        return;
+        return Ok(false);
     }
-    let to_write = interest.clone();
+    let desired = interest.iter().cloned().collect::<BTreeSet<_>>();
+    let required = agent.config().gossip.interest_min_replicas.max(1);
+    let desired_for_tx = desired.clone();
     let res = make_broadcastable_changes(agent, None, move |tx| {
-        // 启动即权威:先删本 actor 不在当前 interest 的旧行,再 upsert 当前。
-        // 防 db 复用 + interest 变更后残留 —— 尤其旧 "*"(wildcard)行会把本节点误当
-        // 任意表的全量持有者/收件人(查询路由 table='*'、推送 selector 并入所有表),破坏部分复制。
-        let placeholders = std::iter::repeat("?")
-            .take(to_write.len())
-            .collect::<Vec<_>>()
-            .join(",");
-        let del_sql = format!(
-            "DELETE FROM node_interest WHERE actor_id = crsql_site_id() \
-             AND table_name NOT IN ({placeholders})"
-        );
-        tx.prepare_cached(&del_sql)
+        let current = tx
+            .prepare_cached(
+                "SELECT table_name, active FROM node_interest \
+                 WHERE actor_id = crsql_site_id()",
+            )
             .map_err(|source| ChangeError::Rusqlite {
                 source,
                 actor_id: None,
                 version: None,
             })?
-            .execute(rusqlite::params_from_iter(to_write.iter()))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+            })
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: None,
+                version: None,
+            })?
+            .collect::<Result<BTreeMap<_, _>, _>>()
             .map_err(|source| ChangeError::Rusqlite {
                 source,
                 actor_id: None,
                 version: None,
             })?;
-        let mut stmt = tx
+
+        let ready_holders = tx
             .prepare_cached(
-                "INSERT OR IGNORE INTO node_interest (actor_id, table_name) \
-                 VALUES (crsql_site_id(), ?)",
+                "SELECT actor_id, table_name FROM node_interest \
+                 WHERE active = 1 AND actor_id != crsql_site_id()",
+            )
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: None,
+                version: None,
+            })?
+            .query_map([], |row| {
+                Ok((row.get::<_, ActorId>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: None,
+                version: None,
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: None,
+                version: None,
+            })?;
+
+        for (table, active) in current
+            .iter()
+            .filter(|(table, _)| !desired_for_tx.contains(*table))
+        {
+            if *active {
+                let ready = count_ready_holders(table, &ready_holders, &live_actors);
+                if ready < required {
+                    return Err(ChangeError::InterestRemovalUnsafe {
+                        table: table.clone(),
+                        ready,
+                        required,
+                    });
+                }
+            }
+            tx.execute(
+                "DELETE FROM node_interest \
+                 WHERE actor_id = crsql_site_id() AND table_name = ?",
+                &[table as &dyn rusqlite::ToSql],
             )
             .map_err(|source| ChangeError::Rusqlite {
                 source,
                 actor_id: None,
                 version: None,
             })?;
-        for t in &to_write {
-            stmt.execute([t]).map_err(|source| ChangeError::Rusqlite {
+        }
+
+        for table in desired_for_tx
+            .iter()
+            .filter(|table| !current.contains_key(*table))
+        {
+            tx.execute(
+                "INSERT INTO node_interest (actor_id, table_name, active) \
+                 VALUES (crsql_site_id(), ?, 0)",
+                &[table as &dyn rusqlite::ToSql],
+            )
+            .map_err(|source| ChangeError::Rusqlite {
                 source,
                 actor_id: None,
                 version: None,
             })?;
         }
-        Ok(())
+
+        Ok(desired_for_tx
+            .iter()
+            .any(|table| !current.get(table).copied().unwrap_or(false)))
     })
     .await;
     match res {
-        Ok(_) => info!("wrote self-declared interest to node_interest: {interest:?}"),
-        Err(e) => {
-            warn!("could not write node_interest (is the node_interest table in your schema?): {e}")
+        Ok((pending, _, _)) => {
+            info!(?interest, pending, "reconciled self-declared node interest");
+            Ok(pending)
+        }
+        Err(ChangeError::Rusqlite { ref source, .. })
+            if source.to_string().contains("no such table: node_interest") =>
+        {
+            warn!("could not write node_interest because the schema does not define it");
+            Ok(false)
+        }
+        Err(e) => Err(eyre::eyre!("could not safely reconcile node_interest: {e}")),
+    }
+}
+
+fn count_ready_holders(
+    removed_table: &str,
+    ready_holders: &[(ActorId, String)],
+    live_actors: &BTreeSet<ActorId>,
+) -> usize {
+    ready_holders
+        .iter()
+        .filter(|(actor_id, table)| {
+            live_actors.contains(actor_id)
+                && if removed_table == "*" {
+                    table == "*"
+                } else {
+                    table == removed_table || table == "*"
+                }
+        })
+        .map(|(actor_id, _)| actor_id)
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
+fn reopened_ranges_are_complete(
+    bookie: &Bookie,
+    reopened: &BTreeMap<ActorId, RangeInclusiveSet<CrsqlDbVersion>>,
+) -> bool {
+    reopened.iter().all(|(actor_id, ranges)| {
+        let Some(booked) = bookie.get(actor_id) else {
+            return false;
+        };
+        let booked = booked.read();
+        let has_needed = booked.needed().iter().any(|needed| {
+            ranges.iter().any(|reopened| {
+                needed.start() <= reopened.end() && reopened.start() <= needed.end()
+            })
+        });
+        let has_partial = booked
+            .partials
+            .keys()
+            .any(|version| ranges.iter().any(|range| range.contains(version)));
+        !has_needed && !has_partial
+    })
+}
+
+fn initial_sync_is_complete(agent: &Agent, bookie: &Bookie) -> bool {
+    let members_synced = agent
+        .members()
+        .read()
+        .states
+        .values()
+        .all(|state| state.last_sync_ts.is_some());
+    let guard = bookie.owned_guard();
+    let bookie_quiescent = bookie.iter(&guard).all(|(_, booked)| {
+        let booked = booked.read();
+        booked.needed().is_empty() && booked.partials.is_empty()
+    });
+    members_synced && bookie_quiescent
+}
+
+async fn activate_pending_interest_when_synced(
+    agent: Agent,
+    bookie: Bookie,
+    reopened_ranges: BTreeMap<ActorId, RangeInclusiveSet<CrsqlDbVersion>>,
+    mut tripwire: Tripwire,
+) {
+    let mut consecutive_quiescent = 0;
+    let started = Instant::now();
+    loop {
+        tokio::select! {
+            _ = &mut tripwire => return,
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+
+        let complete = if reopened_ranges.is_empty() {
+            started.elapsed() >= Duration::from_secs(5) && initial_sync_is_complete(&agent, &bookie)
+        } else {
+            reopened_ranges_are_complete(&bookie, &reopened_ranges)
+        };
+        if complete {
+            consecutive_quiescent += 1;
+        } else {
+            consecutive_quiescent = 0;
+        }
+        if consecutive_quiescent < 2 {
+            continue;
+        }
+
+        match make_broadcastable_changes(&agent, None, |tx| {
+            tx.execute(
+                "UPDATE node_interest SET active = 1 \
+                 WHERE actor_id = crsql_site_id() AND active = 0",
+                &[],
+            )
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: None,
+                version: None,
+            })
+        })
+        .await
+        {
+            Ok((activated, _, _)) => {
+                info!(activated, "activated ready node interest after backfill");
+                return;
+            }
+            Err(e) => {
+                warn!("could not activate pending node interest; will retry: {e}");
+                consecutive_quiescent = 0;
+            }
         }
     }
 }
@@ -336,7 +600,9 @@ fn sync_interest_expanded(previous: &[String], current: &[String]) -> bool {
     current.iter().any(|table| !previous.contains(table))
 }
 
-async fn reopen_filtered_versions_after_interest_expansion(agent: &Agent) -> eyre::Result<u64> {
+async fn reopen_filtered_versions_after_interest_expansion(
+    agent: &Agent,
+) -> eyre::Result<(u64, BTreeMap<ActorId, RangeInclusiveSet<CrsqlDbVersion>>)> {
     let current = effective_sync_interest(agent);
     let current_json = serde_json::to_string(&current)?;
     let bookie = agent.bookie().clone();
@@ -380,6 +646,7 @@ async fn reopen_filtered_versions_after_interest_expansion(agent: &Agent) -> eyr
             .flat_map(|ranges| ranges.iter())
             .map(|range| u64::from(*range.end()) - u64::from(*range.start()) + 1)
             .sum();
+        let reopened_for_readiness = reopened.clone();
         let mut booked_writes = Vec::with_capacity(reopened.len());
         let mut changes = Vec::with_capacity(reopened.len());
         for (actor_id, ranges) in reopened {
@@ -403,13 +670,35 @@ async fn reopen_filtered_versions_after_interest_expansion(agent: &Agent) -> eyr
             booked_write.commit();
         }
 
-        Ok(reopened_count)
+        Ok((reopened_count, reopened_for_readiness))
     })
 }
 
 #[cfg(test)]
 mod interest_backfill_tests {
-    use super::sync_interest_expanded;
+    use super::{count_ready_holders, sync_interest_expanded};
+    use corro_types::actor::ActorId;
+    use std::collections::BTreeSet;
+
+    fn actor(byte: u8) -> ActorId {
+        ActorId::from_bytes([byte; 16])
+    }
+
+    #[test]
+    fn removal_counts_distinct_online_covering_holders() {
+        let holders = vec![
+            (actor(1), "target".into()),
+            (actor(1), "*".into()),
+            (actor(2), "*".into()),
+            (actor(3), "target".into()),
+            (actor(4), "flight".into()),
+        ];
+        let live = BTreeSet::from([actor(1), actor(2), actor(4)]);
+
+        assert_eq!(count_ready_holders("target", &holders, &live), 2);
+        assert_eq!(count_ready_holders("*", &holders, &live), 2);
+        assert_eq!(count_ready_holders("flight", &holders, &live), 3);
+    }
 
     #[test]
     fn detects_only_effective_interest_expansion() {

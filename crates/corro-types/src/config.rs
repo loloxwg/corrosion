@@ -246,6 +246,10 @@ pub struct GossipConfig {
     /// 空 = 关心全部表（= corrosion 现状全量复制行为，opt-in 关闭态）。
     #[serde(default)]
     pub interest: Vec<String>,
+    /// 动态摘除某张表前，集群中必须仍有多少个其他在线且 ready(active=1)的 holder。
+    /// 这是单次/串行 placement 变更的 fail-closed 门禁；并发摘除仍须由控制器串行化。
+    #[serde(default = "default_interest_min_replicas")]
+    pub interest_min_replicas: usize,
     /// 内嵌 GNN(4.3.3 活模型)配置。设置=在 agent 里加载训练好的权重、周期跑推理算
     /// 适配度评分 score(表,平台)驱动 selector 推送目标(仅 broadcast_strategy=rl 时生效)。
     /// 空=不启用(Rl 回退手设方差启发式)。
@@ -618,6 +622,7 @@ impl ConfigBuilder {
                 broadcast_strategy: BroadcastStrategy::default(),
                 interest_routing: Default::default(),
                 interest: Default::default(),
+                interest_min_replicas: default_interest_min_replicas(),
                 graphrl: None,
                 critical_tables: Default::default(),
             },
@@ -632,6 +637,10 @@ impl ConfigBuilder {
             reaper: self.reaper,
         })
     }
+}
+
+fn default_interest_min_replicas() -> usize {
+    1
 }
 
 #[derive(Debug, thiserror::Error)]
