@@ -380,6 +380,17 @@ impl Changeset {
         }
     }
 
+    /// 本变更集触及的表名迭代器。乱序防线用它在进事务前判断本地 schema
+    /// 是否已知这些表(DDL 未到达 → 整版本拒收)。
+    /// `Empty` / `EmptySet` 不携带行变更 → 返回空迭代器,天然不触发拒收。
+    pub fn touched_tables(&self) -> Box<dyn Iterator<Item = &str> + '_> {
+        match self {
+            Changeset::Empty { .. } | Changeset::EmptySet { .. } => Box::new(std::iter::empty()),
+            Changeset::Full { changes, .. } => Box::new(changes.iter().map(|c| c.table.as_str())),
+            Changeset::FullV2 { changes, .. } => Box::new(changes.keys().map(|t| t.as_str())),
+        }
+    }
+
     pub fn into_parts(self) -> Option<ChangesetParts> {
         match self {
             Changeset::Empty { .. } => None,

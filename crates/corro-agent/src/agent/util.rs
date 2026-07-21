@@ -1011,6 +1011,21 @@ pub async fn process_multiple_changes(
                     continue;
                 }
 
+                // 乱序防线:版本触及本地 schema 未知的表(DDL 尚未到达)→ 整版本跳过,
+                // 不标已处理、不 mark cleared,留在 needed 由 anti-entropy 在 DDL 应用后补齐。
+                // 版本粒度(而非行粒度):部分应用会把版本标为已处理,丢失未知表部分。
+                let has_unknown_table = {
+                    let schema = agent.schema().read();
+                    change
+                        .touched_tables()
+                        .any(|table| !schema.tables.contains_key(table))
+                };
+                if has_unknown_table {
+                    counter!("corro.changes.unknown_table.skipped").increment(1);
+                    debug!(%actor_id, versions = ?change.versions(), "version touches unknown table, skipping until DDL arrives");
+                    continue;
+                }
+
                 let versions = change.versions();
 
                 // check if we've seen this version here...

@@ -976,6 +976,107 @@ async fn process_failed_changes() -> eyre::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn unknown_table_change_rejected_without_poisoning() -> eyre::Result<()> {
+    _ = tracing_subscriber::fmt::try_init();
+
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    // ta1 is the node receiving changes; ta2 is the source of a legit change.
+    let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+    let ta2 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+    let tx_timeout = Duration::from_secs(60);
+
+    // Legit change: one row into ta2's `tests3` table, extracted as a change to ship.
+    insert_rows(ta2.agent.clone(), 1, 1).await;
+    let mut rows = get_rows(ta2.agent.clone(), vec![(dbvri!(1, 1), None)]).await?;
+
+    // Unknown-table change: a fresh actor whose version touches a table ta1 has never
+    // seen (DDL not yet arrived). Same shape as `tests` so it applies cleanly once created.
+    let unknown_actor = ActorId(Uuid::parse_str("00000000-0000-0000-b716-446655440000")?);
+    let unknown_change = ChangeV1 {
+        actor_id: unknown_actor,
+        changeset: Changeset::Full {
+            version: CrsqlDbVersion(1),
+            changes: vec![Change {
+                table: TableName("not_yet_created".into()),
+                pk: pack_columns(&vec![1i64.into()])?,
+                cid: ColumnName("text".into()),
+                val: "hello".into(),
+                col_version: 1,
+                db_version: CrsqlDbVersion(1),
+                seq: CrsqlSeq(0),
+                site_id: unknown_actor.to_bytes(),
+                cl: 1,
+            }],
+            seqs: dbsr!(0, 0),
+            last_seq: CrsqlSeq(0),
+            ts: Default::default(),
+        },
+    };
+    rows.push((unknown_change.clone(), ChangeSource::Sync, Instant::now()));
+
+    // Feed both in one batch: the unknown-table version must not poison the batch.
+    let res =
+        process_multiple_changes(ta1.agent.clone(), ta1.bookie.clone(), rows, tx_timeout).await;
+    assert!(res.is_ok(), "batch should not error, got: {res:?}");
+
+    // Legit change was applied.
+    {
+        let conn = ta1.agent.pool().read().await?;
+        let text: String = conn
+            .prepare_cached("SELECT text FROM tests3 WHERE id = 1")?
+            .query_row([], |row| row.get(0))?;
+        assert_eq!(text, "service-name");
+    }
+
+    // Unknown-table version is NOT recorded as known: it stays needed for anti-entropy.
+    {
+        let booked = ta1.bookie.ensure(unknown_actor);
+        let bookedv = booked.read();
+        assert!(
+            !bookedv.contains_version(&CrsqlDbVersion(1)),
+            "unknown-table version must stay unknown (left for sync retry)"
+        );
+    }
+
+    // Once the table exists locally, replaying the SAME change applies successfully.
+    crate::agent::util::execute_schema(
+        &ta1.agent,
+        vec!["CREATE TABLE not_yet_created (id INTEGER NOT NULL PRIMARY KEY, text TEXT NOT NULL DEFAULT \"\") WITHOUT ROWID;".to_string()],
+    )
+    .await?;
+
+    process_multiple_changes(
+        ta1.agent.clone(),
+        ta1.bookie.clone(),
+        vec![(unknown_change, ChangeSource::Sync, Instant::now())],
+        tx_timeout,
+    )
+    .await?;
+
+    {
+        let conn = ta1.agent.pool().read().await?;
+        let text: String = conn
+            .prepare_cached("SELECT text FROM not_yet_created WHERE id = 1")?
+            .query_row([], |row| row.get(0))?;
+        assert_eq!(text, "hello");
+    }
+    {
+        let booked = ta1.bookie.ensure(unknown_actor);
+        let bookedv = booked.read();
+        assert!(
+            bookedv.contains_version(&CrsqlDbVersion(1)),
+            "version should be known after the table exists and the change is replayed"
+        );
+    }
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_process_multiple_changes() -> eyre::Result<()> {
     _ = tracing_subscriber::fmt::try_init();
 
