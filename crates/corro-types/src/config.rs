@@ -183,6 +183,8 @@ pub struct ApiConfig {
     #[serde_as(deserialize_as = "Option<OneOrMany<_, PreferOne>>")]
     #[serde(default)]
     pub pg: Option<Vec<PgConfig>>,
+    #[serde(default)]
+    pub allow_runtime_schema: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -610,6 +612,7 @@ impl ConfigBuilder {
                 endpoint_name: self.endpoint_name,
                 authorization: None,
                 pg: None,
+                allow_runtime_schema: false,
             },
             gossip: GossipConfig {
                 bind_addr: self
