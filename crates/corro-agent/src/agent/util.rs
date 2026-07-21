@@ -1465,6 +1465,15 @@ pub async fn execute_schema_from_paths(agent: &Agent) -> eyre::Result<()> {
         return Ok(());
     }
 
+    // corro_ddl_log 是 corrosion 自有控制表,禁止用户 schema 定义/改写
+    let parsed = parse_sql(&statements.join(";"))?;
+    if parsed.tables.contains_key(corro_types::schema::DDL_LOG_TABLE) {
+        eyre::bail!(
+            "table '{}' is reserved by corrosion (runtime DDL log) and cannot be defined in schema files",
+            corro_types::schema::DDL_LOG_TABLE
+        );
+    }
+
     execute_schema(agent, statements).await
 }
 

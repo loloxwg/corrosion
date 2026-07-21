@@ -1529,6 +1529,39 @@ CREATE TABLE IF NOT EXISTS test_reload2 (
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_execute_schema_from_paths_rejects_reserved_ddl_log_table() -> eyre::Result<()> {
+    _ = tracing_subscriber::fmt::try_init();
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    let ta = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+
+    let schema_dir = ta.tmpdir.path().join("schema");
+    let reserved_sql = r#"
+CREATE TABLE IF NOT EXISTS corro_ddl_log (
+    seq INTEGER NOT NULL PRIMARY KEY,
+    sql TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT ''
+);
+"#;
+    tokio::fs::write(schema_dir.join("reserved.sql"), reserved_sql.as_bytes()).await?;
+
+    let res = execute_schema_from_paths(&ta.agent).await;
+    assert!(
+        res.is_err(),
+        "user schema file redefining corro_ddl_log must be rejected"
+    );
+    assert!(res
+        .unwrap_err()
+        .to_string()
+        .contains("reserved by corrosion"));
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+
+    Ok(())
+}
+
 fn check_obj_exists(conn: &rusqlite::Connection, obj_type: &str, obj_name: &str) -> bool {
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = ? AND name = ?)",
