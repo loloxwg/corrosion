@@ -393,12 +393,15 @@ fn interest_for_sync(agent: &Agent) -> Option<Vec<String>> {
     }
 }
 
-/// 把发起方 interest(Vec<String>) 转成查表用的 HashSet，并恒加入系统复制表 `node_interest`
-/// (否则节点间 interest 自身传不开，Phase 1 失效)。None → None（不过滤，全量）。
+/// 把发起方 interest(Vec<String>) 转成查表用的 HashSet，并恒加入控制面表
+/// `node_interest`(否则节点间 interest 自身传不开，Phase 1 失效)与 `corro_ddl_log`
+/// (运行期 DDL 元数据，须比数据有更强传播保证，不受 interest 过滤)。
+/// 与广播侧豁免(broadcast::selector::CONTROL_TABLES)对齐。None → None（不过滤，全量）。
 fn interest_set(interest: &Option<Vec<String>>) -> Option<std::collections::HashSet<String>> {
     interest.as_ref().map(|tables| {
         let mut set: std::collections::HashSet<String> = tables.iter().cloned().collect();
         set.insert("node_interest".to_string());
+        set.insert("corro_ddl_log".to_string());
         set
     })
 }
