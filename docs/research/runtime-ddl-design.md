@@ -63,7 +63,8 @@ CREATE TABLE corro_ddl_log (
 - **控制表豁免**(硬要求,复用多跳实验教训「元数据须比数据有更强传播保证」):
   - selector `interest_pool` 对触及本表的广播返回 None(不被 interest 过滤,
     与 `node_interest`/CONTROL_TABLE 同待遇);
-  - sync 侧 `interest_for_sync` 恒 include;
+  - sync 侧 `interest_set`(peer/mod.rs)恒 include(同时作用于 SyncStart 声明与
+    serving 侧 `touches_interest` 过滤);
   - GNN/critical 等策略面无需感知(豁免在合法集层,先于策略)。
 
 ### 3.3 应用钩子(数据面)

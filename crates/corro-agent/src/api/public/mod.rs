@@ -288,8 +288,9 @@ pub struct SchemaResponse {
 
 /// `POST /v1/schema`: apply runtime (additive-only) DDL and, on success,
 /// record it as a single row in the `corro_ddl_log` CRR table so the change
-/// broadcasts to the rest of the cluster (remote apply hook lands in a later
-/// task; this endpoint only handles the local control-plane write).
+/// broadcasts to the rest of the cluster; receivers replay it in seq order via
+/// `apply_pending_ddl`, and this endpoint spawns the same sweep after the log
+/// write to keep the control plane's own progress current.
 ///
 /// 门禁顺序:runtime-schema 开关 -> 非空校验 -> corro_ddl_log 保留表守卫(与
 /// execute_schema_from_paths 的守卫镜像,见 agent/util.rs)-> 本地 apply(增量
