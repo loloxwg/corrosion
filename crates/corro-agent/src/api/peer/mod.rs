@@ -401,7 +401,7 @@ fn interest_set(interest: &Option<Vec<String>>) -> Option<std::collections::Hash
     interest.as_ref().map(|tables| {
         let mut set: std::collections::HashSet<String> = tables.iter().cloned().collect();
         set.insert("node_interest".to_string());
-        set.insert("corro_ddl_log".to_string());
+        set.insert(corro_types::schema::DDL_LOG_TABLE.to_string());
         set
     })
 }
@@ -1788,6 +1788,15 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn interest_set_always_includes_control_tables() {
+        let set = interest_set(&Some(vec!["flight".to_string()])).unwrap();
+        assert!(set.contains("node_interest"));
+        assert!(set.contains(corro_types::schema::DDL_LOG_TABLE));
+        assert!(set.contains("flight"));
+        assert!(interest_set(&None).is_none());
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_sync_changes_order() -> eyre::Result<()> {

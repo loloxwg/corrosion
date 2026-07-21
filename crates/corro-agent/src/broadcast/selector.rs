@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 
 use corro_types::config::BroadcastStrategy;
+use corro_types::schema::DDL_LOG_TABLE;
 use metrics::counter;
 use rand::{rngs::StdRng, seq::IteratorRandom, Rng};
 
@@ -160,8 +161,7 @@ fn rl_targets(
 ///   多跳实验(multihop_test.py)把 sync 拉长到 60s 时暴露此问题。
 /// - `corro_ddl_log`:运行期 DDL 元数据,同理须全网可达。
 /// 与对账侧豁免(peer/mod.rs interest_set 恒加入二者)对齐。
-/// 注意与 corro-types::schema::DDL_LOG_TABLE 保持同步(此处用字面量避免跨 crate 依赖膨胀)。
-const CONTROL_TABLES: [&str; 2] = ["node_interest", "corro_ddl_log"];
+const CONTROL_TABLES: [&str; 2] = ["node_interest", DDL_LOG_TABLE];
 
 /// interest 合法集：关心者 + COVERAGE_QUOTA 覆盖名额。
 /// None = 无 interest 信号(关闭态)或控制面广播 → 调用方退化为全打分(不减量，保活性)。
@@ -443,7 +443,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(9);
         let picked = scored_reduce_targets(
             &candidates,
-            &["corro_ddl_log".to_string()],
+            &[DDL_LOG_TABLE.to_string()],
             &routing,
             100,
             &mut rng,
