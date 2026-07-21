@@ -1944,3 +1944,128 @@ async fn runtime_schema_api() -> eyre::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn runtime_ddl_propagates_to_peer() -> eyre::Result<()> {
+    _ = tracing_subscriber::fmt::try_init();
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+
+    // A is the control plane (runtime schema enabled). B bootstraps off A and
+    // NEVER has the flag, so its copy of ont_inst__uav can only come from
+    // replication (DDL row -> corro_ddl_log -> post-commit hook), never from a
+    // local POST /v1/schema (which B would reject with 403).
+    let ta1 = launch_test_agent(
+        |conf| conf.api_allow_runtime_schema(true).build(),
+        tripwire.clone(),
+    )
+    .await?;
+    let ta2 = launch_test_agent(
+        |conf| {
+            conf.bootstrap(vec![ta1.agent.gossip_addr().to_string()])
+                .build()
+        },
+        tripwire.clone(),
+    )
+    .await?;
+
+    let client = reqwest::Client::new();
+    let api_addr = ta1.agent.api_addr();
+
+    // ont_inst__uav is absent from the test schema, so B has no local definition
+    // of it at start.
+    {
+        let conn = ta2.agent.pool().read().await?;
+        assert!(
+            !check_obj_exists(&conn, "table", "ont_inst__uav"),
+            "B must not know ont_inst__uav before replication"
+        );
+    }
+
+    // 2. A: create ont_inst__uav via the control plane -> 200, seq=1.
+    let create_stmt = vec![
+        "CREATE TABLE ont_inst__uav (pk TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL DEFAULT '')"
+            .to_string(),
+    ];
+    let res = client
+        .post(format!("http://{api_addr}/v1/schema"))
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(serde_json::to_vec(&create_stmt)?)
+        .send()
+        .await?;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: SchemaResponse = serde_json::from_slice(&res.bytes().await?)?;
+    assert!(body.applied, "control-plane DDL must apply on A");
+
+    // 3. A: immediately insert a uav row. Race window: B may not have built the
+    //    table yet, so the data change can be rejected version-granular and later
+    //    refetched by anti-entropy once the DDL applies on B.
+    let req_body: Vec<Statement> = serde_json::from_value(json!([[
+        "INSERT INTO ont_inst__uav (pk, name) VALUES (?, ?)",
+        ["uav-1", "drone"]
+    ]]))?;
+    let res = client
+        .post(format!("http://{api_addr}/v1/transactions"))
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(serde_json::to_vec(&req_body)?)
+        .send()
+        .await?;
+    assert_eq!(res.status(), StatusCode::OK);
+    let _body: ExecResponse = serde_json::from_slice(&res.bytes().await?)?;
+
+    // A's authoritative DDL progress: MAX(seq) in the log.
+    let a_max_seq: i64 = ta1
+        .agent
+        .pool()
+        .read()
+        .await?
+        .query_row("SELECT MAX(seq) FROM corro_ddl_log", [], |r| r.get(0))?;
+    assert_eq!(a_max_seq, 1, "single control-plane DDL -> seq 1");
+
+    // 4 + 5. Poll B (generous deadline: sync backoff in debug is seconds) until:
+    //   a. ont_inst__uav exists (DDL replicated + hook applied),
+    //   b. the uav row arrived (fast path, or sync fallback after the DDL lands),
+    //   c. B's __corro_state progress caught up to A's MAX(seq).
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (has_table, row_present, b_progress) = {
+            let conn = ta2.agent.pool().read().await?;
+            let has_table = check_obj_exists(&conn, "table", "ont_inst__uav");
+            let row_present = if has_table {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM ont_inst__uav WHERE pk = 'uav-1' AND name = 'drone')",
+                    [],
+                    |r| r.get::<_, bool>(0),
+                )
+                .unwrap_or(false)
+            } else {
+                false
+            };
+            let b_progress: i64 = conn
+                .query_row(
+                    "SELECT CAST(value AS INTEGER) FROM __corro_state WHERE key = ?",
+                    [DDL_APPLIED_SEQ_KEY],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            (has_table, row_present, b_progress)
+        };
+
+        if has_table && row_present && b_progress == a_max_seq {
+            break;
+        }
+
+        if Instant::now() >= deadline {
+            panic!(
+                "B failed to converge: has_table={has_table} row_present={row_present} \
+                 b_progress={b_progress} a_max_seq={a_max_seq}"
+            );
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+
+    Ok(())
+}
