@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::agent::util::execute_schema_from_paths;
+use crate::agent::util::{execute_schema, execute_schema_from_paths};
 use crate::{
     agent::{
         handlers::{self, spawn_handle_db_maintenance},
@@ -123,6 +123,10 @@ async fn run(
         notifications_rx,
         tripwire.clone(),
     ));
+
+    // corro_ddl_log 是 corrosion 自有 CRR 表,不依赖用户 schema 文件;
+    // 走 execute_schema 以复用 apply_schema 的 crsql_as_crr + __corro_schema 注册。
+    execute_schema(&agent, vec![corro_types::schema::DDL_LOG_SCHEMA.to_owned()]).await?;
 
     // Load schema from paths
     if let Err(e) = execute_schema_from_paths(&agent).await {

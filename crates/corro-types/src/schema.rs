@@ -15,6 +15,16 @@ use sqlite3_parser::ast::{
 };
 use tracing::{debug, info, trace};
 
+/// 运行期 DDL 分发日志表。控制面单写、seq 单调;进控制表豁免清单
+/// (selector 不按 interest 过滤、sync 恒 include,见 selector.rs / peer/mod.rs)。
+pub const DDL_LOG_TABLE: &str = "corro_ddl_log";
+
+pub const DDL_LOG_SCHEMA: &str = "CREATE TABLE corro_ddl_log (
+  seq INTEGER NOT NULL PRIMARY KEY,
+  sql TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT ''
+);";
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Column {
     pub name: String,
