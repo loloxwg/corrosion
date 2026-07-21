@@ -775,7 +775,7 @@ pub async fn process_fully_buffered_changes(
     version: CrsqlDbVersion,
     tx_timeout: Duration,
 ) -> Result<bool, ChangeError> {
-    let rows_impacted = {
+    let (rows_impacted, touched_ddl_log) = {
         assert_sometimes!(true, "Corrosion processes fully buffered changes");
         let booked = bookie.ensure(actor_id);
         let mut conn = agent.pool().write_normal().await?;
@@ -793,13 +793,13 @@ pub async fn process_fully_buffered_changes(
                         if seqs.gaps(&(CrsqlSeq(0)..=*last_seq)).count() != 0 {
                             error!(%actor_id, %version, "found sequence gaps: {:?}, aborting!", seqs.gaps(&(CrsqlSeq(0)..=*last_seq)).collect::<RangeInclusiveSet<CrsqlSeq>>());
                             // TODO: return an error here
-                            return Ok(false);
+                            return Ok((false, false));
                         }
                         *last_seq
                     }
                     None => {
                         warn!(%actor_id, %version, "version not found in cache, returning");
-                        return Ok(false);
+                        return Ok((false, false));
                     }
                 }
             };
@@ -862,6 +862,29 @@ pub async fn process_fully_buffered_changes(
 
             debug!(%actor_id, %version, "rows impacted by buffered changes insertion: {rows_impacted}");
 
+            // corro_ddl_log 行经缓冲/部分版本落库时,提交后同样要触发顺序应用(与
+            // process_multiple_changes 钩子对称)。趁事务在手、缓冲行尚未被 tx_clear_buf
+            // 清走,先探明本版本是否触及日志表,把布尔带出事务外再挂钩。
+            let touched_ddl_log: bool = tx
+                .prepare_cached(
+                    "SELECT EXISTS (SELECT 1 FROM __corro_buffered_changes \
+                     WHERE site_id = ? AND db_version = ? AND \"table\" = ?)",
+                )
+                .map_err(|source| ChangeError::Rusqlite {
+                    source,
+                    actor_id: Some(actor_id),
+                    version: Some(version),
+                })?
+                .query_row(
+                    params![actor_id, version, corro_types::schema::DDL_LOG_TABLE],
+                    |row| row.get(0),
+                )
+                .map_err(|source| ChangeError::Rusqlite {
+                    source,
+                    actor_id: Some(actor_id),
+                    version: Some(version),
+                })?;
+
             bookedw
                 .insert_db(&tx, [version..=version].into())
                 .map_err(|source| ChangeError::Rusqlite {
@@ -894,9 +917,14 @@ pub async fn process_fully_buffered_changes(
                 error!("could not schedule buffered data clear: {e}");
             }
 
-            Ok::<_, ChangeError>(rows_impacted > 0)
+            Ok::<_, ChangeError>((rows_impacted > 0, touched_ddl_log))
         })
     }?;
+
+    // 缓冲版本完成(第三条 apply 路径)携带 DDL 日志行 → 提交后触发顺序应用。
+    if touched_ddl_log {
+        spawn_counted(apply_pending_ddl(agent.clone()));
+    }
 
     if rows_impacted {
         let conn = agent.pool().read().await?;
@@ -1241,7 +1269,9 @@ pub async fn process_multiple_changes(
     }
 
     // DDL 日志表来了新行 → 触发顺序应用(独立 task,不阻塞 apply 路径)。
-    // 广播 apply 与 sync apply 都汇流到 process_multiple_changes,故此处一处挂钩即覆盖两条路径。
+    // remote apply 有三条路径:广播 apply 与 sync apply(整版本可直接落库)都汇流到
+    // 本函数 process_multiple_changes,由此处挂钩;第三条是缓冲/部分版本补齐后由
+    // process_fully_buffered_changes 提交,那里有对称的钩子(见其尾部 touched_ddl_log)。
     // 必须 spawn 而非 inline-await:execute_schema 会抢 write_priority 连接,而此处不能持有写连接阻塞。
     if changesets.iter().any(|(_, cs, _, _)| {
         cs.touched_tables()
@@ -1585,6 +1615,13 @@ pub const DDL_APPLIED_SEQ_KEY: &str = "ddl_log_applied_seq_v1";
 /// 并发安全:多个 apply_pending_ddl 任务可能同时被触发。execute_schema 通过
 /// write 连接 + schema 写锁串行化;重放是 no-op;进度写用单调 CAS(只在新值更大时
 /// 落库),因此即使一个滞后任务用旧 seq 抢跑,也不会把进度回退。
+///
+/// 不做 single-flight 合并:运行期 DDL 是低频事件(对象类型级,非高频写),冗余的
+/// no-op 重扫代价有界、可接受;若将来 DDL 变高频,再引入去抖/合并。
+///
+/// gap-park 正确性依赖单一控制面写者(seq = MAX+1、每个 seq 恰好一个版本);多写者会
+/// 产生 seq 主键冲突(静默丢失、且不产生 gap 信号),故由 api.allow_runtime_schema 的
+/// 部署约定(仅控制面开放 runtime schema 写)来保证单写者前提。
 pub async fn apply_pending_ddl(agent: Agent) {
     let (applied, rows) = {
         let conn = match agent.pool().read().await {
@@ -1626,6 +1663,7 @@ pub async fn apply_pending_ddl(agent: Agent) {
     for (seq, sql) in rows {
         if seq != expected {
             info!("apply_pending_ddl: gap before seq {seq} (expected {expected}), waiting for sync");
+            counter!("corro.ddl.parked.gap").increment(1);
             return; // 空洞停车,不跳号
         }
         // 逐行走 execute_schema(增量 diff、天然幂等);日志里只有控制面验证过的 DDL,
@@ -1633,6 +1671,7 @@ pub async fn apply_pending_ddl(agent: Agent) {
         if let Err(e) = execute_schema(&agent, vec![sql]).await {
             // 单条失败:不推进、不跳号,下次触发重试(失败通常是暂时性资源问题)。
             error!("apply_pending_ddl: failed to apply ddl seq {seq}: {e}");
+            counter!("corro.ddl.apply.failed").increment(1);
             return;
         }
         match agent.pool().write_low().await {
@@ -1654,6 +1693,7 @@ pub async fn apply_pending_ddl(agent: Agent) {
             }
         }
         info!("apply_pending_ddl: applied ddl seq {seq}");
+        counter!("corro.ddl.applied").increment(1);
         expected += 1;
     }
 }
