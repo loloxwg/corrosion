@@ -501,6 +501,7 @@ pub struct ConfigBuilder {
     member_id: Option<MemberId>,
     max_mtu: Option<u16>,
     disable_gso: bool,
+    allow_runtime_schema: bool,
 }
 
 impl ConfigBuilder {
@@ -586,6 +587,12 @@ impl ConfigBuilder {
         self
     }
 
+    /// Allow runtime (additive-only) DDL via `POST /v1/schema` (`api.allow_runtime_schema`).
+    pub fn api_allow_runtime_schema(mut self, allow: bool) -> Self {
+        self.allow_runtime_schema = allow;
+        self
+    }
+
     pub fn build(self) -> Result<Config, ConfigBuilderError> {
         let db_path = self.db_path.ok_or(ConfigBuilderError::DbPathRequired)?;
 
@@ -612,7 +619,7 @@ impl ConfigBuilder {
                 endpoint_name: self.endpoint_name,
                 authorization: None,
                 pg: None,
-                allow_runtime_schema: false,
+                allow_runtime_schema: self.allow_runtime_schema,
             },
             gossip: GossipConfig {
                 bind_addr: self

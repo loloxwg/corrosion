@@ -25,7 +25,7 @@ use crate::{
     agent::{process_multiple_changes, util::execute_schema_from_paths},
     api::{
         peer::parallel_sync,
-        public::{api_v1_transactions, TimeoutParams},
+        public::{api_v1_transactions, SchemaResponse, TimeoutParams},
     },
     transport::Transport,
 };
@@ -1569,4 +1569,149 @@ fn check_obj_exists(conn: &rusqlite::Connection, obj_type: &str, obj_name: &str)
         |row| row.get(0),
     )
     .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_schema_api() -> eyre::Result<()> {
+    _ = tracing_subscriber::fmt::try_init();
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    let ta = launch_test_agent(
+        |conf| conf.api_allow_runtime_schema(true).build(),
+        tripwire.clone(),
+    )
+    .await?;
+
+    let client = reqwest::Client::new();
+    let api_addr = ta.agent.api_addr();
+
+    let create_stmt = vec![
+        "CREATE TABLE ont_inst__uav (pk TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL DEFAULT '')"
+            .to_string(),
+    ];
+
+    // 1. create a brand-new additive table -> 200, table + __crsql_clock exist, corro_ddl_log seq=1
+    let res = client
+        .post(format!("http://{api_addr}/v1/schema"))
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(serde_json::to_vec(&create_stmt)?)
+        .send()
+        .await?;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: SchemaResponse = serde_json::from_slice(&res.bytes().await?)?;
+    assert!(body.applied);
+    assert!(body.error.is_none());
+
+    {
+        let conn = ta.agent.pool().read().await?;
+        assert!(check_obj_exists(&conn, "table", "ont_inst__uav"));
+        assert!(check_obj_exists(
+            &conn,
+            "table",
+            "ont_inst__uav__crsql_clock"
+        ));
+        let (seq, sql): (i64, String) = conn.query_row(
+            "SELECT seq, sql FROM corro_ddl_log ORDER BY seq DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(seq, 1);
+        assert!(sql.contains("ont_inst__uav"));
+    }
+
+    // 2. re-posting the same statement is a no-op apply but still logs -> 200, seq=2
+    let res2 = client
+        .post(format!("http://{api_addr}/v1/schema"))
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(serde_json::to_vec(&create_stmt)?)
+        .send()
+        .await?;
+    assert_eq!(res2.status(), StatusCode::OK);
+    let body2: SchemaResponse = serde_json::from_slice(&res2.bytes().await?)?;
+    assert!(body2.applied);
+    {
+        let conn = ta.agent.pool().read().await?;
+        let max_seq: i64 =
+            conn.query_row("SELECT MAX(seq) FROM corro_ddl_log", [], |row| row.get(0))?;
+        assert_eq!(max_seq, 2, "idempotent repost must still append a log row");
+    }
+
+    // 3. destructive change (drops the `name` column) -> 400, no new log row
+    let destructive_stmt =
+        vec!["CREATE TABLE ont_inst__uav (pk TEXT NOT NULL PRIMARY KEY)".to_string()];
+    let res3 = client
+        .post(format!("http://{api_addr}/v1/schema"))
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(serde_json::to_vec(&destructive_stmt)?)
+        .send()
+        .await?;
+    assert_eq!(res3.status(), StatusCode::BAD_REQUEST);
+    let body3: SchemaResponse = serde_json::from_slice(&res3.bytes().await?)?;
+    assert!(!body3.applied);
+    assert!(body3.error.is_some());
+    {
+        let conn = ta.agent.pool().read().await?;
+        let max_seq: i64 =
+            conn.query_row("SELECT MAX(seq) FROM corro_ddl_log", [], |row| row.get(0))?;
+        assert_eq!(
+            max_seq, 2,
+            "rejected destructive change must not add a log row"
+        );
+    }
+
+    // 4. reserved control table -> 400, no new log row, corro_ddl_log schema itself unchanged
+    let reserved_stmt =
+        vec!["CREATE TABLE corro_ddl_log (seq INTEGER NOT NULL PRIMARY KEY)".to_string()];
+    let res4 = client
+        .post(format!("http://{api_addr}/v1/schema"))
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(serde_json::to_vec(&reserved_stmt)?)
+        .send()
+        .await?;
+    assert_eq!(res4.status(), StatusCode::BAD_REQUEST);
+    let body4: SchemaResponse = serde_json::from_slice(&res4.bytes().await?)?;
+    assert!(!body4.applied);
+    assert!(body4.error.unwrap().contains("reserved"));
+    {
+        let conn = ta.agent.pool().read().await?;
+        let max_seq: i64 =
+            conn.query_row("SELECT MAX(seq) FROM corro_ddl_log", [], |row| row.get(0))?;
+        assert_eq!(max_seq, 2, "reserved-table POST must not add a log row");
+
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(corro_ddl_log)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<_>>()?;
+        assert_eq!(
+            cols,
+            vec![
+                "seq".to_string(),
+                "sql".to_string(),
+                "created_at".to_string()
+            ],
+            "corro_ddl_log's own schema must be untouched by a rejected POST"
+        );
+    }
+
+    // 5. runtime schema disabled on this node -> 403, no interaction with the control plane
+    let (tripwire_off, tripwire_off_worker, tripwire_off_tx) = Tripwire::new_simple();
+    let ta_off = launch_test_agent(|conf| conf.build(), tripwire_off.clone()).await?;
+    let res5 = client
+        .post(format!("http://{}/v1/schema", ta_off.agent.api_addr()))
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(serde_json::to_vec(&create_stmt)?)
+        .send()
+        .await?;
+    assert_eq!(res5.status(), StatusCode::FORBIDDEN);
+    let body5: SchemaResponse = serde_json::from_slice(&res5.bytes().await?)?;
+    assert!(!body5.applied);
+    assert!(body5.error.unwrap().contains("allow_runtime_schema"));
+
+    tripwire_off_tx.send(()).await.ok();
+    tripwire_off_worker.await;
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+
+    Ok(())
 }

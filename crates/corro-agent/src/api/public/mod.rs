@@ -26,13 +26,14 @@ use corro_types::{
     broadcast::{BiPayload, BiPayloadV1, Timestamp},
     change::{insert_local_changes, InsertChangesInfo, SqliteValue},
     persistent_gauge,
+    schema::parse_sql,
     sqlite::SqlitePoolError,
 };
 use futures::SinkExt;
 use hyper::StatusCode;
 use metrics::{counter, histogram};
 use rusqlite::{params_from_iter, ToSql, Transaction};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use spawn::spawn_counted;
 use speedy::Writable;
 use sqlite_pool::{Committable, InterruptibleTransaction, SqliteConn};
@@ -268,6 +269,118 @@ pub async fn api_v1_transactions(
             actor_id: Some(actor_id),
         }),
     )
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SchemaResponse {
+    pub applied: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub time: f64,
+}
+
+/// `POST /v1/schema`: apply runtime (additive-only) DDL and, on success,
+/// record it as a single row in the `corro_ddl_log` CRR table so the change
+/// broadcasts to the rest of the cluster (remote apply hook lands in a later
+/// task; this endpoint only handles the local control-plane write).
+///
+/// 门禁顺序:runtime-schema 开关 -> 非空校验 -> corro_ddl_log 保留表守卫(与
+/// execute_schema_from_paths 的守卫镜像,见 agent/util.rs)-> 本地 apply(增量
+/// 校验,破坏性变更 400)-> 写 corro_ddl_log 一行(seq = MAX+1,单一控制面写入
+/// 无并发冲突)。本地 apply 成功但日志写失败时返回 500,重复 POST 是 no-op,
+/// 调用方可安全重试。
+#[tracing::instrument(skip_all)]
+pub async fn api_v1_schema(
+    Extension(agent): Extension<Agent>,
+    axum::extract::Json(statements): axum::extract::Json<Vec<String>>,
+) -> (StatusCode, axum::Json<SchemaResponse>) {
+    let start = Instant::now();
+    let reply = |code: StatusCode, err: Option<String>| {
+        (
+            code,
+            axum::Json(SchemaResponse {
+                applied: err.is_none(),
+                error: err,
+                time: start.elapsed().as_secs_f64(),
+            }),
+        )
+    };
+
+    if !agent.config().api.allow_runtime_schema {
+        return reply(
+            StatusCode::FORBIDDEN,
+            Some(
+                "runtime schema updates are disabled on this node (api.allow_runtime_schema)"
+                    .into(),
+            ),
+        );
+    }
+    if statements.is_empty() {
+        return reply(
+            StatusCode::BAD_REQUEST,
+            Some("at least one statement is required".into()),
+        );
+    }
+
+    // corro_ddl_log 是 corrosion 自有控制表,不能被当作普通用户表重新定义/改写。
+    // 镜像 execute_schema_from_paths(agent/util.rs)里的同一守卫。
+    match parse_sql(&statements.join(";")) {
+        Ok(parsed) => {
+            if parsed
+                .tables
+                .contains_key(corro_types::schema::DDL_LOG_TABLE)
+            {
+                return reply(
+                    StatusCode::BAD_REQUEST,
+                    Some(format!(
+                        "table '{}' is reserved by corrosion (runtime DDL log) and cannot be defined via POST /v1/schema",
+                        corro_types::schema::DDL_LOG_TABLE
+                    )),
+                );
+            }
+        }
+        Err(e) => {
+            return reply(StatusCode::BAD_REQUEST, Some(e.to_string()));
+        }
+    }
+
+    // 先本地应用:execute_schema 自带增量校验,破坏性变更(删表/删列/改列)
+    // 会返回 SchemaError("won't drop/remove/change ... without the destructive flag")→ 400。
+    // 本地成功后才写日志表,保证 corro_ddl_log 里只有可应用的 DDL。
+    if let Err(e) = crate::agent::util::execute_schema(&agent, statements.clone()).await {
+        return reply(StatusCode::BAD_REQUEST, Some(e.to_string()));
+    }
+
+    // 一次 POST = 一行日志(语句合并),seq = MAX+1(单一控制面写入,无冲突)。
+    let joined = statements.join(";\n");
+    let res = make_broadcastable_changes(&agent, None, move |tx| {
+        tx.prepare_cached(
+            "INSERT INTO corro_ddl_log (seq, sql, created_at) \
+             VALUES ((SELECT COALESCE(MAX(seq), 0) + 1 FROM corro_ddl_log), ?, ?)",
+        )
+        .map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: None,
+            version: None,
+        })?
+        .execute(rusqlite::params![
+            joined,
+            time::OffsetDateTime::now_utc().to_string()
+        ])
+        .map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: None,
+            version: None,
+        })?;
+        Ok(())
+    })
+    .await;
+
+    match res {
+        // 本地已 apply 但日志写失败:返回 500,调用方重试;重复 apply 是 no-op,安全。
+        Err(e) => reply(StatusCode::INTERNAL_SERVER_ERROR, Some(e.to_string())),
+        Ok(_) => reply(StatusCode::OK, None),
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

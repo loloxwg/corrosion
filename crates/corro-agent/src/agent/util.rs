@@ -8,7 +8,7 @@
 use crate::{
     agent::{handlers, CountedExecutor, TO_CLEAR_COUNT},
     api::public::{
-        api_v1_health, api_v1_queries, api_v1_table_stats, api_v1_transactions,
+        api_v1_health, api_v1_queries, api_v1_schema, api_v1_table_stats, api_v1_transactions,
         pubsub::{api_v1_sub_by_id, api_v1_subs},
         update::SharedUpdateBroadcastCache,
     },
@@ -204,6 +204,22 @@ pub async fn setup_http_api_handler(
                     }))
                     .layer(LoadShedLayer::new())
                     .layer(ConcurrencyLimitLayer::new(128)),
+            ),
+        )
+        // runtime schema (DDL)
+        .route(
+            "/v1/schema",
+            post(api_v1_schema).route_layer(
+                tower::ServiceBuilder::new()
+                    .layer(HandleErrorLayer::new(|_error: BoxError| async {
+                        Ok::<_, Infallible>((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "max concurrency limit reached".to_string(),
+                        ))
+                    }))
+                    .layer(LoadShedLayer::new())
+                    // DDL 低频且串行语义,并发限 1
+                    .layer(ConcurrencyLimitLayer::new(1)),
             ),
         )
         // queries
