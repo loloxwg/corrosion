@@ -948,6 +948,17 @@ pub async fn process_fully_buffered_changes(
     Ok(rows_impacted)
 }
 
+/// 版本是否触及本地 schema 未知的表(对应 DDL 尚未到达)。
+/// 乱序防线的核心判据,ingest 侧(handle_changes 的 seen 去重豁免)与
+/// apply 侧(process_multiple_changes 的整版本跳过)共用,避免两处条件漂移。
+/// schema 读锁作用域收紧在函数内。
+pub(crate) fn touches_unknown_table(agent: &Agent, change: &ChangeV1) -> bool {
+    let schema = agent.schema().read();
+    change
+        .touched_tables()
+        .any(|table| !schema.tables.contains_key(table))
+}
+
 #[tracing::instrument(skip(agent, bookie, changes), err)]
 pub async fn process_multiple_changes(
     agent: Agent,
@@ -1042,13 +1053,7 @@ pub async fn process_multiple_changes(
                 // 乱序防线:版本触及本地 schema 未知的表(DDL 尚未到达)→ 整版本跳过,
                 // 不标已处理、不 mark cleared,留在 needed 由 anti-entropy 在 DDL 应用后补齐。
                 // 版本粒度(而非行粒度):部分应用会把版本标为已处理,丢失未知表部分。
-                let has_unknown_table = {
-                    let schema = agent.schema().read();
-                    change
-                        .touched_tables()
-                        .any(|table| !schema.tables.contains_key(table))
-                };
-                if has_unknown_table {
+                if touches_unknown_table(&agent, &change) {
                     counter!("corro.changes.unknown_table.skipped").increment(1);
                     debug!(%actor_id, versions = ?change.versions(), "version touches unknown table, skipping until DDL arrives");
                     continue;

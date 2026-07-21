@@ -12,7 +12,7 @@ use std::{
 use crate::{
     agent::{
         bi, bootstrap, uni,
-        util::{log_at_pow_10, process_multiple_changes},
+        util::{log_at_pow_10, process_multiple_changes, touches_unknown_table},
         SyncClientError, ANNOUNCE_INTERVAL,
     },
     api::peer::parallel_sync,
@@ -998,12 +998,7 @@ pub async fn handle_changes(
         // 但 seen 缓存只在内存压力下淘汰,一次拒收后会把该版本永久短路,重投再也到不了
         // process_multiple_changes → 「数据先于 DDL 到达」场景下数据永久丢失。故对未知表版本
         // 既不查也不写 seen(bookie 去重仍生效);与 process_multiple_changes 的未知表条件同构。
-        let touches_unknown_table = {
-            let schema = agent.schema().read();
-            change
-                .touched_tables()
-                .any(|table| !schema.tables.contains_key(table))
-        };
+        let touches_unknown_table = touches_unknown_table(&agent, &change);
 
         // Skip changes we've already seen recently in the seen cache
         if !touches_unknown_table {
