@@ -273,6 +273,13 @@ pub async fn api_v1_transactions(
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SchemaResponse {
+    /// True whenever `execute_schema` (the local DDL apply) succeeded,
+    /// regardless of whether the `corro_ddl_log` write/broadcast afterwards
+    /// also succeeded. On the 403/400 paths (disabled, empty body, reserved
+    /// table, or a rejected/invalid DDL statement) nothing was applied, so
+    /// this is `false`. On the 500 path (log write failed after a successful
+    /// apply) the schema change IS live locally, so this is `true` even
+    /// though `error` is set.
     pub applied: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -289,17 +296,25 @@ pub struct SchemaResponse {
 /// 校验,破坏性变更 400)-> 写 corro_ddl_log 一行(seq = MAX+1,单一控制面写入
 /// 无并发冲突)。本地 apply 成功但日志写失败时返回 500,重复 POST 是 no-op,
 /// 调用方可安全重试。
+///
+/// 崩溃窗口:本地 apply(execute_schema 的事务)与写日志
+/// (make_broadcastable_changes 的事务)是两个独立事务,中间没有原子性保证。
+/// 若进程在两者之间崩溃:schema 已在本地生效,但 corro_ddl_log 未写入、也
+/// 未广播给其他节点;此时调用方连响应都收不到(连接直接断开),因此必须把
+/// "无响应"当作未知结果处理——原样重试同一 POST 即可:execute_schema 对已
+/// 应用过的 DDL 是幂等 no-op(不会二次报错),重试请求会顺着流程走到写日志
+/// 那一步,把这次真正补上。调用方不应假设"没收到响应"等于"没有生效"。
 #[tracing::instrument(skip_all)]
 pub async fn api_v1_schema(
     Extension(agent): Extension<Agent>,
     axum::extract::Json(statements): axum::extract::Json<Vec<String>>,
 ) -> (StatusCode, axum::Json<SchemaResponse>) {
     let start = Instant::now();
-    let reply = |code: StatusCode, err: Option<String>| {
+    let reply = |code: StatusCode, applied: bool, err: Option<String>| {
         (
             code,
             axum::Json(SchemaResponse {
-                applied: err.is_none(),
+                applied,
                 error: err,
                 time: start.elapsed().as_secs_f64(),
             }),
@@ -309,6 +324,7 @@ pub async fn api_v1_schema(
     if !agent.config().api.allow_runtime_schema {
         return reply(
             StatusCode::FORBIDDEN,
+            false,
             Some(
                 "runtime schema updates are disabled on this node (api.allow_runtime_schema)"
                     .into(),
@@ -318,6 +334,7 @@ pub async fn api_v1_schema(
     if statements.is_empty() {
         return reply(
             StatusCode::BAD_REQUEST,
+            false,
             Some("at least one statement is required".into()),
         );
     }
@@ -332,6 +349,7 @@ pub async fn api_v1_schema(
             {
                 return reply(
                     StatusCode::BAD_REQUEST,
+                    false,
                     Some(format!(
                         "table '{}' is reserved by corrosion (runtime DDL log) and cannot be defined via POST /v1/schema",
                         corro_types::schema::DDL_LOG_TABLE
@@ -340,7 +358,7 @@ pub async fn api_v1_schema(
             }
         }
         Err(e) => {
-            return reply(StatusCode::BAD_REQUEST, Some(e.to_string()));
+            return reply(StatusCode::BAD_REQUEST, false, Some(e.to_string()));
         }
     }
 
@@ -348,10 +366,18 @@ pub async fn api_v1_schema(
     // 会返回 SchemaError("won't drop/remove/change ... without the destructive flag")→ 400。
     // 本地成功后才写日志表,保证 corro_ddl_log 里只有可应用的 DDL。
     if let Err(e) = crate::agent::util::execute_schema(&agent, statements.clone()).await {
-        return reply(StatusCode::BAD_REQUEST, Some(e.to_string()));
+        return reply(StatusCode::BAD_REQUEST, false, Some(e.to_string()));
     }
 
+    // 从这里开始 schema 已经在本地生效(applied=true 与日志写入结果无关)——
+    // 见上方崩溃窗口说明与 SchemaResponse::applied 的文档注释。
+    //
     // 一次 POST = 一行日志(语句合并),seq = MAX+1(单一控制面写入,无冲突)。
+    // seq 计的是"被接受的 POST 次数",不是去重后的 DDL 次数:同一条语句重复
+    // POST(幂等 no-op apply)仍会各自追加一行重复记录。因此任何回放这份日志
+    // 的消费方(Task 6 的远端 apply 钩子)必须逐行走 execute_schema(增量 diff、
+    // 天然幂等),绝不能把 sql 列当成可以直接裸执行的语句——重复行直接
+    // execute 可能在没有增量校验的情况下出错或产生非预期效果。
     let joined = statements.join(";\n");
     let res = make_broadcastable_changes(&agent, None, move |tx| {
         tx.prepare_cached(
@@ -363,10 +389,7 @@ pub async fn api_v1_schema(
             actor_id: None,
             version: None,
         })?
-        .execute(rusqlite::params![
-            joined,
-            time::OffsetDateTime::now_utc().to_string()
-        ])
+        .execute(rusqlite::params![joined, ddl_log_created_at()])
         .map_err(|source| ChangeError::Rusqlite {
             source,
             actor_id: None,
@@ -377,10 +400,21 @@ pub async fn api_v1_schema(
     .await;
 
     match res {
-        // 本地已 apply 但日志写失败:返回 500,调用方重试;重复 apply 是 no-op,安全。
-        Err(e) => reply(StatusCode::INTERNAL_SERVER_ERROR, Some(e.to_string())),
-        Ok(_) => reply(StatusCode::OK, None),
+        // 本地已 apply 但日志写失败:返回 500,调用方重试;重试时 execute_schema
+        // 对已生效的 DDL 是 no-op,只会把这次日志行补上,安全。
+        Err(e) => reply(StatusCode::INTERNAL_SERVER_ERROR, true, Some(e.to_string())),
+        Ok(_) => reply(StatusCode::OK, true, None),
     }
+}
+
+/// RFC3339 timestamp for `corro_ddl_log.created_at`. Falls back to the
+/// `Display` format (only reachable if formatting somehow fails, which
+/// `OffsetDateTime::now_utc()` never triggers in practice) rather than
+/// panicking on a control-plane write.
+fn ddl_log_created_at() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| time::OffsetDateTime::now_utc().to_string())
 }
 
 #[derive(Debug, thiserror::Error)]
