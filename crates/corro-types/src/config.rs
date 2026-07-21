@@ -185,6 +185,8 @@ pub struct ApiConfig {
     pub pg: Option<Vec<PgConfig>>,
     #[serde(default)]
     pub allow_runtime_schema: bool,
+    #[serde(default)]
+    pub allow_runtime_interest: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -502,6 +504,7 @@ pub struct ConfigBuilder {
     max_mtu: Option<u16>,
     disable_gso: bool,
     allow_runtime_schema: bool,
+    allow_runtime_interest: bool,
 }
 
 impl ConfigBuilder {
@@ -593,6 +596,12 @@ impl ConfigBuilder {
         self
     }
 
+    /// Allow runtime interest updates via `POST /v1/interest` (`api.allow_runtime_interest`).
+    pub fn api_allow_runtime_interest(mut self, allow: bool) -> Self {
+        self.allow_runtime_interest = allow;
+        self
+    }
+
     pub fn build(self) -> Result<Config, ConfigBuilderError> {
         let db_path = self.db_path.ok_or(ConfigBuilderError::DbPathRequired)?;
 
@@ -620,6 +629,7 @@ impl ConfigBuilder {
                 authorization: None,
                 pg: None,
                 allow_runtime_schema: self.allow_runtime_schema,
+                allow_runtime_interest: self.allow_runtime_interest,
             },
             gossip: GossipConfig {
                 bind_addr: self
