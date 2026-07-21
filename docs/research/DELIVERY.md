@@ -101,7 +101,11 @@ release 已确认单节点 39,234 QPS；独立起压器复核后 20 核机台稳
 - **设计文档**:[1b-design](active-push-1b-design.md)(对账过滤)、[route-a-design](active-push-route-a-design.md)(单进程裁剪)、
   [query-routing-design](active-push-query-routing-design.md)(4.4.2)、[rl-design](active-push-rl-design.md)(4.3.3)、
   [cluster-design](active-push-cluster-design.md)(圈子方案,因"一进程"约束未采用,存档)、
-  [task-driven-semantic-replication-roadmap](task-driven-semantic-replication-roadmap.md)(未来任务/本体驱动语义复制路线，非当前已实现能力)。
+  [task-driven-semantic-replication-roadmap](task-driven-semantic-replication-roadmap.md)(未来任务/本体驱动语义复制路线，非当前已实现能力)、
+  [runtime-ddl-design](runtime-ddl-design.md) + [runtime-ddl-plan](runtime-ddl-plan.md)(**运行期集群建表,已实现**:
+  `POST /v1/schema` → `corro_ddl_log` CRR 分发 → 顺序幂等应用;证据 `crates/corro-agent` 测试
+  `runtime_schema_api`/`ddl_log_applies_in_order_and_parks_on_gap`/`runtime_ddl_propagates_to_peer` +
+  `research/harness/ddl_runtime_test.py`(6 节点健康/断链多跳/后入网/越权 403 四场景,25~29s 收敛))。
 - **harness 基础**:`research/harness/run.py`(mission 拓扑 + 配置生成 + 度量)。
 - **教学原型**:`sandbox/gossipdb/`(200 行 HLC/CRDT/SWIM/对账,吃透 corrosion 用,非生产)。
 

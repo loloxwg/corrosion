@@ -38,8 +38,14 @@ SQLite 事务提交
 
 ### 1.3 当前尚未实现
 
+> 更新(2026-07-21):**运行期建表已实现**——控制面经 `POST /v1/schema` 发起加表/加列,
+> DDL 以 `corro_ddl_log` CRR 行分发全集群,各节点按 seq 顺序幂等应用;数据先于 DDL 到达
+> 按版本拒收、anti-entropy 兜底。设计与边界见
+> [runtime-ddl-design](runtime-ddl-design.md)。本体每 ObjectType 绑一张表的
+> 运行期落地通道已打通(ontology-web `ensure_type_table` 直连此 API)。
+
 - 任务或本体自动生成 `gossip.interest`。
-- 进程运行期间通过 API/Consul watch 热更新 interest。
+- 进程运行期间通过 API/Consul watch 热更新 interest(注意:**schema 热更已可**,interest 热更仍未做)。
 - RL/GNN 自动改变长期 placement。
 - 按 `mission_id`、区域、目标类别、优先级或任意语义谓词过滤行。
 - Corrosion 内置的无人机任务执行器、执行权仲裁或 exactly-once 外部动作。

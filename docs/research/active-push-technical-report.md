@@ -261,3 +261,31 @@ Replication**；**Task-driven Semantic Replication** 是下一阶段演进方向
 后，再评估版本级作用域索引；任意行级谓词和在线大模型不直接进入复制热路径。完整分阶段路线、
 正确性不变量、无人机双通道和验证门禁见
 [`task-driven-semantic-replication-roadmap.md`](task-driven-semantic-replication-roadmap.md)。
+
+### 7.1 已落地第一步：运行期集群建表(2026-07-21)
+
+本体每个 ObjectType 绑定一张实例表,ObjectType 运行期新增 → 需要运行期建表并可靠分发全集群。
+已实现,机制为「DDL 即数据」:
+
+- **入口**:控制面节点(`api.allow_runtime_schema = true`,默认关)`POST /v1/schema`,
+  仅接受加表/加列(破坏性变更 400,保留表 `corro_ddl_log` 自身 400);本地
+  `execute_schema` 成功后,DDL 语句作为一行写入 CRR 控制表 `corro_ddl_log`(seq 单调)。
+- **分发**:复用 corrosion 复制面(广播 + anti-entropy),`corro_ddl_log` 进控制表豁免
+  清单(selector 不按 interest 过滤、sync 恒 include)——分发、重试、断线补齐、新节点
+  补历史零新增机制。各节点提交后钩子按 seq **顺序幂等**应用(`execute_schema` diff 语义),
+  进度存 `__corro_state`,遇 seq 空洞停车等对账补行;钩子覆盖三条到达路径
+  (广播 apply / sync apply / buffered 完成)。指标:`corro.ddl.applied` /
+  `corro.ddl.parked.gap` / `corro.ddl.apply.failed`。
+- **乱序防线**:数据先于 DDL 到达 → 触及未知表的版本**整版本拒收**,不入 bookie、
+  不标 cleared,DDL 应用后由 anti-entropy 补齐。**实现中 e2e 抓出并修复一个设计文档
+  未预见的真 bug**:ingest 层 `seen` 去重缓存会把被拒版本永久短路(重投永远到不了
+  apply → 行永久丢失),修复为未知表版本豁免 seen 缓存(持久 bookie 去重不受影响)。
+- **实测**:Rust 双节点 e2e(建表+竞态写数)~9s 收敛;harness 6 节点四场景
+  (健康收敛 / node0→node3 断链多跳 / 第 7 节点后入网补齐 / 越权 403 全网零痕迹)
+  25~29s 全过。ontology-web 侧 `ensure_type_table` 从「写文件+reload(仅本机)」改为
+  一次 `POST /v1/schema`(闭合此前评审缺口「多节点 schema 分发」)。
+- **诚实边界**:删表/删列不在本机制内(带外 destructive 流程);全网生效为最终一致
+  (秒级传播),不提供「建表即全网可见」强保证;**单写者前提**——多控制面并发发 DDL
+  会 seq 主键碰撞、LWW 静默丢失且无空洞信号,靠部署约定(仅控制面开 flag)保证;
+  本地 apply 与日志写为两事务,崩溃窗口靠调用方重试(幂等)收敛;用户 schema 文件
+  若定义保留表,与既有 schema 错误一致为软失败记日志。
