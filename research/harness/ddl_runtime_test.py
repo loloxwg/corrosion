@@ -159,12 +159,6 @@ def ddl_progress(nd):
         return 0
 
 
-def converged(nd, prefix, rows, seq):
-    return (table_exists(nd, TABLE)
-            and count_local(nd, TABLE, prefix) == rows
-            and ddl_progress(nd) >= seq)
-
-
 # ---------- 控制面 API ----------
 
 def post_schema(api_port, statements, timeout=10):
@@ -240,11 +234,13 @@ def scenario_healthy_and_late_join():
         code, body = post_schema(nodes[1]["api"],
                                  [f"CREATE TABLE {TABLE} (pk TEXT NOT NULL PRIMARY KEY)"])
         s6_403 = (code == 403)
-        # 越权 POST 不得在 node1 本地建出表(该请求在 flag 门禁处即被拒,未触碰 schema)。
-        s6_notable = not table_exists(nodes[1], TABLE)
+        # 越权 POST 不得在**任何**节点建出表:该请求在 node1 的 flag 门禁处即被拒(未触碰
+        # schema),也不得经复制把表带到全网。此刻 ont_inst__demo 尚未被任何合法控制面创建,
+        # 故全 6 节点都应无此表——安全相关场景做全集群断言,而非只看 node1。
+        s6_notable = all(not table_exists(nd, TABLE) for nd in nodes)
         results["s6"] = s6_403 and s6_notable
         print(f"    状态码={code}(期望403:{'✓' if s6_403 else '✗'}), "
-              f"node1 未旁路建表:{'✓' if s6_notable else '✗'} "
+              f"全 6 节点未旁路建表:{'✓' if s6_notable else '✗'} "
               f"→ {'✅ PASS' if results['s6'] else '❌ FAIL'}")
 
         # --- 场景 1/2/3:控制面建表 + 立刻写 20 行 + 全网收敛 ---
