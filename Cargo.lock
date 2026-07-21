@@ -923,6 +923,7 @@ dependencies = [
  "indexmap 2.11.0",
  "itertools 0.14.0",
  "metrics",
+ "metrics-util",
  "opentelemetry",
  "parking_lot",
  "pin-project-lite",

@@ -753,3 +753,74 @@ pub async fn broadcast_changes(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn change_on(table: &str) -> Change {
+        Change {
+            table: TableName(table.into()),
+            pk: vec![0u8],
+            cid: ColumnName("c".into()),
+            val: "v".into(),
+            col_version: 1,
+            db_version: CrsqlDbVersion(1),
+            seq: CrsqlSeq(0),
+            site_id: [0u8; 16],
+            cl: 1,
+        }
+    }
+
+    // The unknown-table pre-filter (process_multiple_changes) depends entirely on this
+    // accessor: it rejects a version iff `touched_tables()` yields a table not in the
+    // local schema. These lock the accessor's behaviour for every Changeset variant so a
+    // change here can't silently defeat the filter.
+
+    #[test]
+    fn touched_tables_full_lists_every_change_table_including_dupes() {
+        let cs = Changeset::Full {
+            version: CrsqlDbVersion(1),
+            changes: vec![change_on("a"), change_on("a"), change_on("b")],
+            seqs: CrsqlSeqRange::new(CrsqlSeq(0), CrsqlSeq(2)),
+            last_seq: CrsqlSeq(2),
+            ts: Timestamp::default(),
+        };
+        let tables: Vec<&str> = cs.touched_tables().collect();
+        assert_eq!(tables, vec!["a", "a", "b"]);
+    }
+
+    #[test]
+    fn touched_tables_fullv2_lists_distinct_table_keys() {
+        let mut changes = ChangesetPerTable::default();
+        changes.insert(change_on("a"));
+        changes.insert(change_on("a")); // same table collapses to one key
+        changes.insert(change_on("b"));
+        let cs = Changeset::FullV2 {
+            actor_id: ActorId::default(),
+            version: CrsqlDbVersion(1),
+            changes,
+            last_seq: CrsqlSeq(1),
+            seqs: CrsqlSeqRange::new(CrsqlSeq(0), CrsqlSeq(1)),
+            ts: Timestamp::default(),
+        };
+        let mut tables: Vec<&str> = cs.touched_tables().collect();
+        tables.sort();
+        assert_eq!(tables, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn touched_tables_empty_and_empty_set_yield_nothing() {
+        let empty = Changeset::Empty {
+            versions: CrsqlDbVersionRange::single(CrsqlDbVersion(3)),
+            ts: None,
+        };
+        assert_eq!(empty.touched_tables().count(), 0);
+
+        let empty_set = Changeset::EmptySet {
+            versions: vec![CrsqlDbVersionRange::single(CrsqlDbVersion(4))],
+            ts: Timestamp::default(),
+        };
+        assert_eq!(empty_set.touched_tables().count(), 0);
+    }
+}

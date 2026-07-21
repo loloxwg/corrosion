@@ -1015,9 +1015,46 @@ async fn unknown_table_change_rejected_without_poisoning() -> eyre::Result<()> {
     rows.push((unknown_change.clone(), ChangeSource::Sync, Instant::now()));
 
     // Feed both in one batch: the unknown-table version must not poison the batch.
-    let res =
-        process_multiple_changes(ta1.agent.clone(), ta1.bookie.clone(), rows, tx_timeout).await;
+    //
+    // NOTE on why the counter assertion below (not just the DB/bookie assertions) is
+    // what actually fences the filter contract: the legacy path (no pre-filter) reaches
+    // `INSERT INTO crsql_changes`, which raises a clean "no schema for table" error that
+    // does NOT roll back the immediate transaction, so the old error branch `continue`s and
+    // leaves identical black-box state (legit change applied, unknown version unrecorded).
+    // On this platform the DB/bookie assertions therefore pass with OR without the filter.
+    // The only behaviour unique to the filter is: skipping BEFORE `process_single_version`
+    // (no wasted crsql work, no ERROR log, no `assert_unreachable!` error branch under
+    // antithesis) and emitting `corro.changes.unknown_table.skipped`. We install a
+    // thread-local debugging recorder — scoped to this call so parallel tests are
+    // unaffected — and assert that counter fired exactly once. This is the assertion that
+    // fails if the filter is removed.
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let res = {
+        // `LocalRecorderGuard` is !Send, but a `#[tokio::test]` body runs under `block_on`
+        // (no Send bound), and the counter fires inside `block_in_place` on this same thread.
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        process_multiple_changes(ta1.agent.clone(), ta1.bookie.clone(), rows, tx_timeout).await
+    };
     assert!(res.is_ok(), "batch should not error, got: {res:?}");
+
+    let skipped: u64 = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter_map(|(ck, _, _, val)| {
+            (ck.key().name() == "corro.changes.unknown_table.skipped")
+                .then_some(val)
+                .and_then(|val| match val {
+                    metrics_util::debugging::DebugValue::Counter(v) => Some(v),
+                    _ => None,
+                })
+        })
+        .sum();
+    assert_eq!(
+        skipped, 1,
+        "unknown-table version must be skipped by the pre-filter exactly once"
+    );
 
     // Legit change was applied.
     {

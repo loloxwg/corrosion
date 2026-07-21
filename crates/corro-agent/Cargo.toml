@@ -76,6 +76,7 @@ corro-tests = { path = "../corro-tests" }
 reqwest.workspace = true
 http-body = { workspace = true }
 criterion = { version = "0.5", features = ["async_tokio"] }
+metrics-util = { workspace = true }
 
 [[bench]]
 name = "process_changes"
