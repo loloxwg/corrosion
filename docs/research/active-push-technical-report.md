@@ -249,3 +249,15 @@ RTT 均匀,真实异构网络多跳绕行代价不会是 0;debug 构建 sync 默
 
 **方法学**:全程"设计 → Codex 对抗复核 → 实现 → 实测(重复均值)→ 诚实记录(含失败)",
 多处靠 Codex 复核纠偏(payload 混表根因、一进程约束下路线选择、RL 奖励 hacking 防护、稳定化、1M QPS 可达性骨架)。
+
+## 7. 未来演进：从 Interest-aware 到 Task-driven Semantic Replication
+
+当前交付已经形成按表 interest 的主动部分复制框架，但任务、本体尚不会自动生成或热更新
+placement，也未实现行级语义复制和无人机任务执行器。因此现状应称为 **Interest-aware
+Replication**；**Task-driven Semantic Replication** 是下一阶段演进方向，而不是本报告已完成能力。
+
+近期优先实现“任务/本体规则 → 确定性表级 InterestPlan → 单控制器串行 handoff”，继续复用现有
+`active` readiness、历史回填、最小副本数和 epoch fencing。数据具备稳定 `mission_id/region_id`
+后，再评估版本级作用域索引；任意行级谓词和在线大模型不直接进入复制热路径。完整分阶段路线、
+正确性不变量、无人机双通道和验证门禁见
+[`task-driven-semantic-replication-roadmap.md`](task-driven-semantic-replication-roadmap.md)。

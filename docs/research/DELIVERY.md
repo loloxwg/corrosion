@@ -100,7 +100,8 @@ release 已确认单节点 39,234 QPS；独立起压器复核后 20 核机台稳
 
 - **设计文档**:[1b-design](active-push-1b-design.md)(对账过滤)、[route-a-design](active-push-route-a-design.md)(单进程裁剪)、
   [query-routing-design](active-push-query-routing-design.md)(4.4.2)、[rl-design](active-push-rl-design.md)(4.3.3)、
-  [cluster-design](active-push-cluster-design.md)(圈子方案,因"一进程"约束未采用,存档)。
+  [cluster-design](active-push-cluster-design.md)(圈子方案,因"一进程"约束未采用,存档)、
+  [task-driven-semantic-replication-roadmap](task-driven-semantic-replication-roadmap.md)(未来任务/本体驱动语义复制路线，非当前已实现能力)。
 - **harness 基础**:`research/harness/run.py`(mission 拓扑 + 配置生成 + 度量)。
 - **教学原型**:`sandbox/gossipdb/`(200 行 HLC/CRDT/SWIM/对账,吃透 corrosion 用,非生产)。
 
