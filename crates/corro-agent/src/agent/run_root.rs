@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::agent::util::{execute_schema, execute_schema_from_paths};
+use crate::agent::util::{apply_pending_ddl, execute_schema, execute_schema_from_paths};
 use crate::{
     agent::{
         handlers::{self, spawn_handle_db_maintenance},
@@ -132,6 +132,9 @@ async fn run(
     if let Err(e) = execute_schema_from_paths(&agent).await {
         error!("could not execute schema: {e}");
     }
+
+    // 停机期间经 sync 落库的 DDL 行没有触发提交钩子,启动补扫一次(顺序应用 + 空洞停车)。
+    apply_pending_ddl(agent.clone()).await;
 
     // stale/reused epoch 必须在改动 sync interest bookkeeping 之前被拒绝，避免旧配置即使
     // 最终启动失败，仍提前改写本地回填状态。

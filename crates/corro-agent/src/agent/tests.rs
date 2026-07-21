@@ -22,7 +22,10 @@ use tripwire::Tripwire;
 use uuid::Uuid;
 
 use crate::{
-    agent::{process_multiple_changes, util::execute_schema_from_paths},
+    agent::{
+        process_multiple_changes,
+        util::{apply_pending_ddl, execute_schema_from_paths, DDL_APPLIED_SEQ_KEY},
+    },
     api::{
         peer::parallel_sync,
         public::{api_v1_transactions, SchemaResponse, TimeoutParams},
@@ -1707,6 +1710,94 @@ fn check_obj_exists(conn: &rusqlite::Connection, obj_type: &str, obj_name: &str)
         |row| row.get(0),
     )
     .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ddl_log_applies_in_order_and_parks_on_gap() -> eyre::Result<()> {
+    _ = tracing_subscriber::fmt::try_init();
+    let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+    let ta = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+
+    // 1. seed seq=1 and seq=3 directly (gap at 2), simulating remote DDL rows that
+    //    landed via sync.
+    {
+        let conn = ta.agent.pool().write_priority().await?;
+        conn.execute(
+            "INSERT INTO corro_ddl_log (seq, sql, created_at) VALUES (?, ?, ?)",
+            rusqlite::params![
+                1i64,
+                "CREATE TABLE t1 (pk TEXT NOT NULL PRIMARY KEY)",
+                "2026-01-01T00:00:00Z"
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO corro_ddl_log (seq, sql, created_at) VALUES (?, ?, ?)",
+            rusqlite::params![
+                3i64,
+                "CREATE TABLE t3 (pk TEXT NOT NULL PRIMARY KEY)",
+                "2026-01-01T00:00:00Z"
+            ],
+        )?;
+    }
+
+    // 2. apply -> t1 created, t3 not (parked on the gap before seq 2), progress == 1.
+    apply_pending_ddl(ta.agent.clone()).await;
+    {
+        let conn = ta.agent.pool().read().await?;
+        assert!(check_obj_exists(&conn, "table", "t1"), "seq=1 must apply");
+        assert!(
+            !check_obj_exists(&conn, "table", "t3"),
+            "seq=3 must be parked behind the gap at seq=2"
+        );
+        let applied: i64 = conn.query_row(
+            "SELECT CAST(value AS INTEGER) FROM __corro_state WHERE key = ?",
+            [DDL_APPLIED_SEQ_KEY],
+            |r| r.get(0),
+        )?;
+        assert_eq!(applied, 1, "progress stops at last contiguous seq");
+    }
+
+    // 3. fill the gap with seq=2 -> both t2 and t3 apply, progress advances to 3.
+    {
+        let conn = ta.agent.pool().write_priority().await?;
+        conn.execute(
+            "INSERT INTO corro_ddl_log (seq, sql, created_at) VALUES (?, ?, ?)",
+            rusqlite::params![
+                2i64,
+                "CREATE TABLE t2 (pk TEXT NOT NULL PRIMARY KEY)",
+                "2026-01-01T00:00:00Z"
+            ],
+        )?;
+    }
+    apply_pending_ddl(ta.agent.clone()).await;
+    {
+        let conn = ta.agent.pool().read().await?;
+        assert!(check_obj_exists(&conn, "table", "t2"), "seq=2 must apply");
+        assert!(
+            check_obj_exists(&conn, "table", "t3"),
+            "seq=3 must apply once the gap is filled"
+        );
+        let applied: i64 = conn.query_row(
+            "SELECT CAST(value AS INTEGER) FROM __corro_state WHERE key = ?",
+            [DDL_APPLIED_SEQ_KEY],
+            |r| r.get(0),
+        )?;
+        assert_eq!(applied, 3, "progress advances to the last contiguous seq");
+    }
+
+    // 4. re-run with no new rows -> idempotent no-op, progress unchanged.
+    apply_pending_ddl(ta.agent.clone()).await;
+    {
+        let conn = ta.agent.pool().read().await?;
+        let applied: i64 = conn.query_row(
+            "SELECT CAST(value AS INTEGER) FROM __corro_state WHERE key = ?",
+            [DDL_APPLIED_SEQ_KEY],
+            |r| r.get(0),
+        )?;
+        assert_eq!(applied, 3, "replay must be a no-op");
+    }
+
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

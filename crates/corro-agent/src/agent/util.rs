@@ -1239,6 +1239,17 @@ pub async fn process_multiple_changes(
     for (_actor_id, changeset, _db_version, _src) in &changesets {
         change_chunk_size += changeset.len();
     }
+
+    // DDL 日志表来了新行 → 触发顺序应用(独立 task,不阻塞 apply 路径)。
+    // 广播 apply 与 sync apply 都汇流到 process_multiple_changes,故此处一处挂钩即覆盖两条路径。
+    // 必须 spawn 而非 inline-await:execute_schema 会抢 write_priority 连接,而此处不能持有写连接阻塞。
+    if changesets.iter().any(|(_, cs, _, _)| {
+        cs.touched_tables()
+            .any(|t| t == corro_types::schema::DDL_LOG_TABLE)
+    }) {
+        spawn_counted(apply_pending_ddl(agent.clone()));
+    }
+
     tokio::spawn(async move {
         for (_actor_id, changeset, db_version, _src) in changesets {
             match_changes(agent.subs_manager(), &changeset, db_version);
@@ -1561,6 +1572,81 @@ pub async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Res
     *schema_write = new_schema;
 
     Ok(())
+}
+
+/// __corro_state key tracking the highest `corro_ddl_log.seq` applied locally.
+pub const DDL_APPLIED_SEQ_KEY: &str = "ddl_log_applied_seq_v1";
+
+/// 按 seq 顺序应用 corro_ddl_log 中未应用的 DDL。
+/// 遇 seq 空洞即停(等 anti-entropy 补行后由下次触发续跑)。
+/// 幂等:execute_schema 是增量 diff 语义;并发重入安全(重放=no-op,进度只前进)。
+/// 进度推进与 DDL 应用非同事务:崩溃窗口=已应用未推进 → 重放 no-op 后推进,可接受。
+///
+/// 并发安全:多个 apply_pending_ddl 任务可能同时被触发。execute_schema 通过
+/// write 连接 + schema 写锁串行化;重放是 no-op;进度写用单调 CAS(只在新值更大时
+/// 落库),因此即使一个滞后任务用旧 seq 抢跑,也不会把进度回退。
+pub async fn apply_pending_ddl(agent: Agent) {
+    let (applied, rows) = {
+        let conn = match agent.pool().read().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                warn!("apply_pending_ddl: no read conn: {e}");
+                return;
+            }
+        };
+        let applied: i64 = conn
+            .prepare_cached("SELECT CAST(value AS INTEGER) FROM __corro_state WHERE key = ?")
+            .and_then(|mut s| s.query_row([DDL_APPLIED_SEQ_KEY], |r| r.get(0)))
+            .unwrap_or(0);
+        let rows: Vec<(i64, String)> = match conn
+            .prepare_cached("SELECT seq, sql FROM corro_ddl_log WHERE seq > ? ORDER BY seq ASC")
+            .and_then(|mut s| {
+                s.query_map([applied], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<rusqlite::Result<_>>()
+            }) {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!("apply_pending_ddl: read ddl log: {e}");
+                return;
+            }
+        };
+        (applied, rows)
+    };
+
+    let mut expected = applied + 1;
+    for (seq, sql) in rows {
+        if seq != expected {
+            info!("apply_pending_ddl: gap before seq {seq} (expected {expected}), waiting for sync");
+            return; // 空洞停车,不跳号
+        }
+        // 逐行走 execute_schema(增量 diff、天然幂等);日志里只有控制面验证过的 DDL,
+        // 绝不裸执行 sql 列(见 api/public/mod.rs 上 corro_ddl_log INSERT 的说明)。
+        if let Err(e) = execute_schema(&agent, vec![sql]).await {
+            // 单条失败:不推进、不跳号,下次触发重试(失败通常是暂时性资源问题)。
+            error!("apply_pending_ddl: failed to apply ddl seq {seq}: {e}");
+            return;
+        }
+        match agent.pool().write_low().await {
+            Ok(conn) => {
+                // 单调 CAS:仅当本次 seq 大于已记录进度时才落库,避免滞后任务回退进度。
+                if let Err(e) = conn.execute(
+                    "INSERT INTO __corro_state (key, value) VALUES (?, ?) \
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value \
+                     WHERE CAST(excluded.value AS INTEGER) > CAST(value AS INTEGER)",
+                    params![DDL_APPLIED_SEQ_KEY, seq],
+                ) {
+                    error!("apply_pending_ddl: failed to record progress at seq {seq}: {e}");
+                    return;
+                }
+            }
+            Err(e) => {
+                error!("apply_pending_ddl: no write conn to record progress at seq {seq}: {e}");
+                return;
+            }
+        }
+        info!("apply_pending_ddl: applied ddl seq {seq}");
+        expected += 1;
+    }
 }
 
 pub fn check_buffered_meta_to_clear(
