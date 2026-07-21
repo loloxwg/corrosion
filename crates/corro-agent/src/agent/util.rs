@@ -1594,10 +1594,19 @@ pub async fn apply_pending_ddl(agent: Agent) {
                 return;
             }
         };
-        let applied: i64 = conn
+        let applied: i64 = match conn
             .prepare_cached("SELECT CAST(value AS INTEGER) FROM __corro_state WHERE key = ?")
             .and_then(|mut s| s.query_row([DDL_APPLIED_SEQ_KEY], |r| r.get(0)))
-            .unwrap_or(0);
+        {
+            Ok(v) => v,
+            // 首次运行没有进度行 → 从 0 起。仅吞 QueryReturnedNoRows;
+            // 真实错误(BUSY 等)必须停车,不能被当成"进度=0"触发整段重放。
+            Err(rusqlite::Error::QueryReturnedNoRows) => 0,
+            Err(e) => {
+                warn!("apply_pending_ddl: read progress: {e}");
+                return;
+            }
+        };
         let rows: Vec<(i64, String)> = match conn
             .prepare_cached("SELECT seq, sql FROM corro_ddl_log WHERE seq > ? ORDER BY seq ASC")
             .and_then(|mut s| {

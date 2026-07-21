@@ -403,7 +403,15 @@ pub async fn api_v1_schema(
         // 本地已 apply 但日志写失败:返回 500,调用方重试;重试时 execute_schema
         // 对已生效的 DDL 是 no-op,只会把这次日志行补上,安全。
         Err(e) => reply(StatusCode::INTERNAL_SERVER_ERROR, true, Some(e.to_string())),
-        Ok(_) => reply(StatusCode::OK, true, None),
+        Ok(_) => {
+            // 控制面的 corro_ddl_log 写入直接落库(make_broadcastable_changes),不走
+            // process_multiple_changes,故不会触发提交钩子。这里显式跑一次 apply_pending_ddl
+            // 推进本节点的 ddl_log_applied_seq_v1:自己的行经 execute_schema 是 no-op,进度
+            // 单调前进,避免每次启动扫尾把整段 DDL 历史当 no-op 重放(O(n)/boot)。同时自愈
+            // 此前任何滞后进度。
+            spawn_counted(crate::agent::util::apply_pending_ddl(agent.clone()));
+            reply(StatusCode::OK, true, None)
+        }
     }
 }
 
