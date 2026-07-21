@@ -993,22 +993,36 @@ pub async fn handle_changes(
             continue;
         }
 
+        // 乱序防线延伸:触及本地未知表的版本(DDL 尚未到达)不能进 seen 短路去重缓存。
+        // process_multiple_changes 会按未知表跳过该版本(不入 bookie),留给 anti-entropy 重投;
+        // 但 seen 缓存只在内存压力下淘汰,一次拒收后会把该版本永久短路,重投再也到不了
+        // process_multiple_changes → 「数据先于 DDL 到达」场景下数据永久丢失。故对未知表版本
+        // 既不查也不写 seen(bookie 去重仍生效);与 process_multiple_changes 的未知表条件同构。
+        let touches_unknown_table = {
+            let schema = agent.schema().read();
+            change
+                .touched_tables()
+                .any(|table| !schema.tables.contains_key(table))
+        };
+
         // Skip changes we've already seen recently in the seen cache
-        if let Some(mut seqs) = change.seqs() {
-            let v = change.versions().start();
-            if let Some(seen_seqs) = seen.get(&(change.actor_id, v)) {
-                if seqs.all(|seq| seen_seqs.contains(&seq)) {
-                    continue;
+        if !touches_unknown_table {
+            if let Some(mut seqs) = change.seqs() {
+                let v = change.versions().start();
+                if let Some(seen_seqs) = seen.get(&(change.actor_id, v)) {
+                    if seqs.all(|seq| seen_seqs.contains(&seq)) {
+                        continue;
+                    }
                 }
+            } else if change
+                .versions()
+                .all(|v| seen.contains_key(&(change.actor_id, v)))
+            {
+                if matches!(src, ChangeSource::Broadcast) {
+                    counter!("corro.broadcast.duplicate.count", "from" => "cache").increment(1);
+                }
+                continue;
             }
-        } else if change
-            .versions()
-            .all(|v| seen.contains_key(&(change.actor_id, v)))
-        {
-            if matches!(src, ChangeSource::Broadcast) {
-                counter!("corro.broadcast.duplicate.count", "from" => "cache").increment(1);
-            }
-            continue;
         }
 
         // Update logical clock if needed
@@ -1063,10 +1077,13 @@ pub async fn handle_changes(
 
         // Register the new change in the seen cache
         // this will only run once for a non-empty changeset
-        for v in change.versions() {
-            let entry = seen.entry((change.actor_id, v)).or_default();
-            if let Some(seqs) = change.seqs() {
-                entry.extend([seqs.into()]);
+        // (未知表版本不入 seen:见上方 touches_unknown_table 注释,避免拒收后被永久短路)
+        if !touches_unknown_table {
+            for v in change.versions() {
+                let entry = seen.entry((change.actor_id, v)).or_default();
+                if let Some(seqs) = change.seqs() {
+                    entry.extend([seqs.into()]);
+                }
             }
         }
 
