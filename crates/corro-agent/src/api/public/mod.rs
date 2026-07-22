@@ -506,51 +506,35 @@ pub async fn api_v1_interest(
             }),
         )
     };
+    // Every failure site is accepted=false / no pending / 0 ranges; only the
+    // success site varies, so collapse the rejections through this.
+    let err = |code: StatusCode, msg: String| reply(code, false, false, 0, Some(msg));
 
     // ① gates: flag, table syntax, epoch.
     if !agent.config().api.allow_runtime_interest {
-        return reply(
+        return err(
             StatusCode::FORBIDDEN,
-            false,
-            false,
-            0,
-            Some(
-                "runtime interest updates are disabled on this node (api.allow_runtime_interest)"
-                    .into(),
-            ),
+            "runtime interest updates are disabled on this node (api.allow_runtime_interest)"
+                .into(),
         );
     }
     if req.tables.is_empty() {
         // `interest` semantics: empty = "care about everything". We refuse to
         // infer that here — the caller must say so explicitly with ["*"], the
         // same constraint boot-time epoch validation enforces.
-        return reply(
+        return err(
             StatusCode::BAD_REQUEST,
-            false,
-            false,
-            0,
-            Some(
-                "tables must be a non-empty list; use [\"*\"] for full replication".into(),
-            ),
+            "tables must be a non-empty list; use [\"*\"] for full replication".into(),
         );
     }
     if req.tables.iter().any(|table| table.trim().is_empty()) {
-        return reply(
+        return err(
             StatusCode::BAD_REQUEST,
-            false,
-            false,
-            0,
-            Some("table names must be non-empty strings".into()),
+            "table names must be non-empty strings".into(),
         );
     }
     if req.epoch == 0 {
-        return reply(
-            StatusCode::BAD_REQUEST,
-            false,
-            false,
-            0,
-            Some("epoch must be greater than 0".into()),
-        );
+        return err(StatusCode::BAD_REQUEST, "epoch must be greater than 0".into());
     }
     // Dedupe; `desired` is the canonical set used for both the precheck and the
     // hot-swapped config (order-insensitive, matching reconcile's set semantics).
@@ -583,33 +567,40 @@ pub async fn api_v1_interest(
             Ok((applied, current != desired))
         }),
         Err(e) => {
-            return reply(
+            return err(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                false,
-                false,
-                0,
-                Some(format!("could not acquire read connection: {e}")),
+                format!("could not acquire read connection: {e}"),
             );
         }
     };
     let (applied_epoch, placement_changed) = match precheck {
         Ok(v) => v,
         Err(e) => {
-            return reply(
+            return err(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                false,
-                false,
-                0,
-                Some(format!("interest precheck failed: {e}")),
+                format!("interest precheck failed: {e}"),
             );
         }
     };
     if let Err(e) = check_interest_epoch(req.epoch, applied_epoch, placement_changed) {
-        return reply(StatusCode::CONFLICT, false, false, 0, Some(e.to_string()));
+        return err(StatusCode::CONFLICT, e.to_string());
     }
 
     // ③ hot-swap config: from here sync/reconcile read the new interest scope.
     // Keep the pre-request Config for rollback on any later failure.
+    //
+    // Sole-mutator invariant: this handler is the ONLY runtime mutator of
+    // `agent.config()`, and the route's ConcurrencyLimit(1) serializes its
+    // invocations. The load-clone-store below is therefore lost-update-free.
+    // A second concurrent config mutator would reintroduce the classic
+    // read-modify-write race on the ArcSwap and must not be added without a
+    // shared lock.
+    //
+    // Panic-safety: rollback below relies on the Err paths *returning*, not on
+    // unwinding. If a callee panicked between the swap and a rollback, config
+    // would stay on the new scope — but the callees all return Result and
+    // ConcurrencyLimit(1) means no other request observes the interim, so that
+    // window is theoretical, not a live hazard.
     let old_config: Config = {
         let guard = agent.config();
         (**guard).clone()
@@ -625,12 +616,9 @@ pub async fn api_v1_interest(
         Ok((_reopened_versions, ranges)) => ranges,
         Err(e) => {
             agent.set_config(old_config);
-            return reply(
+            return err(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                false,
-                false,
-                0,
-                Some(format!("could not reopen filtered versions: {e}")),
+                format!("could not reopen filtered versions: {e:#}"),
             );
         }
     };
@@ -646,19 +634,20 @@ pub async fn api_v1_interest(
         Ok(pending) => pending,
         Err(e) => {
             agent.set_config(old_config);
-            let msg = e.to_string();
-            // reconcile_own_interest flattens ChangeError into eyre; map the
-            // conflict-class failures (removal guard / epoch fencing) to 409 and
-            // everything else to 500. Substrings match the ChangeError Display.
-            let code = if msg.contains("unsafe interest removal")
-                || msg.contains("stale interest epoch")
-                || msg.contains("was reused for a different placement")
-            {
-                StatusCode::CONFLICT
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
+            // reconcile_own_interest wraps the typed ChangeError as the eyre
+            // source; downcast to classify conflict-class failures (removal
+            // guard / epoch fencing) as 409 and everything else as 500.
+            let code = match e.downcast_ref::<ChangeError>() {
+                Some(
+                    ChangeError::InterestRemovalUnsafe { .. }
+                    | ChangeError::StaleInterestEpoch { .. }
+                    | ChangeError::ReusedInterestEpoch { .. },
+                ) => StatusCode::CONFLICT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
             };
-            return reply(code, false, false, 0, Some(msg));
+            // `{:#}` renders the full eyre chain so the specific reason (the
+            // ChangeError Display) still reaches the caller in the body.
+            return err(code, format!("{e:#}"));
         }
     };
 

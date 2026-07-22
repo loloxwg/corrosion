@@ -579,7 +579,10 @@ pub(crate) async fn reconcile_own_interest(
             warn!("could not write node_interest because the schema does not define it");
             Ok(false)
         }
-        Err(e) => Err(eyre::eyre!("could not safely reconcile node_interest: {e}")),
+        // Preserve the typed ChangeError as the eyre source so callers (the
+        // runtime `POST /v1/interest` handler) can downcast to classify the
+        // failure instead of string-matching the Display.
+        Err(e) => Err(eyre::Error::new(e).wrap_err("could not safely reconcile node_interest")),
     }
 }
 
