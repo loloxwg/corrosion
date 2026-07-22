@@ -25,6 +25,7 @@ use corro_types::{
     base::CrsqlDbVersion,
     broadcast::{BiPayload, BiPayloadV1, Timestamp},
     change::{insert_local_changes, InsertChangesInfo, SqliteValue},
+    config::Config,
     persistent_gauge,
     schema::parse_sql,
     sqlite::SqlitePoolError,
@@ -32,7 +33,7 @@ use corro_types::{
 use futures::SinkExt;
 use hyper::StatusCode;
 use metrics::{counter, histogram};
-use rusqlite::{params_from_iter, ToSql, Transaction};
+use rusqlite::{params_from_iter, OptionalExtension, ToSql, Transaction};
 use serde::{Deserialize, Serialize};
 use spawn::spawn_counted;
 use speedy::Writable;
@@ -51,6 +52,13 @@ use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use tracing::{debug, error, trace, warn};
 
 use corro_types::broadcast::broadcast_changes;
+use tripwire::Tripwire;
+
+use crate::agent::run_root::{
+    activate_pending_interest_when_synced, check_interest_epoch, live_actor_ids,
+    reconcile_own_interest, reopen_filtered_versions_after_interest_expansion,
+    INTEREST_EPOCH_STATE_KEY,
+};
 
 pub mod pubsub;
 
@@ -424,6 +432,256 @@ fn ddl_log_created_at() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| time::OffsetDateTime::now_utc().to_string())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InterestUpdate {
+    /// Full desired set of tables this node should replicate (not a delta).
+    /// `["*"]` means full replication; must be explicit — an empty list is rejected.
+    pub tables: Vec<String>,
+    /// Monotonic placement fencing token. Must be > 0 and strictly increasing
+    /// versus the persisted `interest_epoch_v1`.
+    pub epoch: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InterestResponse {
+    /// True only when the placement change was accepted and committed
+    /// (`node_interest` reconciled + epoch persisted). Every 4xx/5xx path is
+    /// `false`, and on those paths the hot-swapped config has been rolled back.
+    pub accepted: bool,
+    /// True when at least one newly-added table was inserted as `active = 0`
+    /// (pending backfill); a background task will flip it to `active = 1` once
+    /// the reopened history is synced. False for pure removals / no-ops.
+    pub pending_activation: bool,
+    /// Number of per-actor filtered-version ranges reopened by the interest
+    /// expansion (0 when nothing was previously filtered out).
+    pub reopened_ranges: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub time: f64,
+}
+
+/// `POST /v1/interest`: change THIS node's replication interest at runtime,
+/// mirroring the boot-time placement protocol (`run_root.rs`) step-for-step but
+/// triggered live. The seven steps below map 1:1 onto the boot orchestration:
+/// epoch fencing precheck → hot-swap `gossip.interest`/`interest_epoch` config →
+/// reopen previously-filtered history → reconcile `node_interest` (active gating
+/// + removal min-replica guard, second epoch check inside the txn) → spawn the
+/// async activation task.
+///
+/// Config hot-swap is the whole lever: every sync/reconcile read point calls
+/// `agent.config()` fresh, so `set_config` makes the new scope effective
+/// immediately without parameterizing those functions.
+///
+/// Rollback: on ANY failure in the reopen/reconcile steps the config is swapped
+/// back to the pre-request value before replying. That leaves a brief window
+/// where sync used the new scope and then reverted — directionally harmless:
+/// an over-accept just stores a bit more, an over-filter is repaired by
+/// anti-entropy, and the recorded filtered ranges make even that recoverable.
+///
+/// `live_actor_ids` reflects SWIM's current membership view; a holder that just
+/// died but hasn't yet been marked Down briefly still counts as live. That is
+/// inherent SWIM latency and identical to the boot path's removal guard.
+#[tracing::instrument(skip_all)]
+pub async fn api_v1_interest(
+    Extension(agent): Extension<Agent>,
+    Extension(tripwire): Extension<Tripwire>,
+    axum::extract::Json(req): axum::extract::Json<InterestUpdate>,
+) -> (StatusCode, axum::Json<InterestResponse>) {
+    let start = Instant::now();
+    let reply = |code: StatusCode,
+                 accepted: bool,
+                 pending_activation: bool,
+                 reopened_ranges: usize,
+                 error: Option<String>| {
+        (
+            code,
+            axum::Json(InterestResponse {
+                accepted,
+                pending_activation,
+                reopened_ranges,
+                error,
+                time: start.elapsed().as_secs_f64(),
+            }),
+        )
+    };
+
+    // ① gates: flag, table syntax, epoch.
+    if !agent.config().api.allow_runtime_interest {
+        return reply(
+            StatusCode::FORBIDDEN,
+            false,
+            false,
+            0,
+            Some(
+                "runtime interest updates are disabled on this node (api.allow_runtime_interest)"
+                    .into(),
+            ),
+        );
+    }
+    if req.tables.is_empty() {
+        // `interest` semantics: empty = "care about everything". We refuse to
+        // infer that here — the caller must say so explicitly with ["*"], the
+        // same constraint boot-time epoch validation enforces.
+        return reply(
+            StatusCode::BAD_REQUEST,
+            false,
+            false,
+            0,
+            Some(
+                "tables must be a non-empty list; use [\"*\"] for full replication".into(),
+            ),
+        );
+    }
+    if req.tables.iter().any(|table| table.trim().is_empty()) {
+        return reply(
+            StatusCode::BAD_REQUEST,
+            false,
+            false,
+            0,
+            Some("table names must be non-empty strings".into()),
+        );
+    }
+    if req.epoch == 0 {
+        return reply(
+            StatusCode::BAD_REQUEST,
+            false,
+            false,
+            0,
+            Some("epoch must be greater than 0".into()),
+        );
+    }
+    // Dedupe; `desired` is the canonical set used for both the precheck and the
+    // hot-swapped config (order-insensitive, matching reconcile's set semantics).
+    let desired: BTreeSet<String> = req.tables.iter().map(|t| t.trim().to_string()).collect();
+    let tables: Vec<String> = desired.iter().cloned().collect();
+
+    // ② epoch fencing precheck (outside any write txn): read the applied epoch
+    // and whether the placement actually changes, then reuse check_interest_epoch.
+    // This is the loud, cheap gate before we mutate config; reconcile re-checks
+    // the same predicate inside its txn as a belt-and-suspenders guard.
+    let precheck = match agent.pool().read().await {
+        Ok(conn) => block_in_place(|| -> Result<(Option<u64>, bool), rusqlite::Error> {
+            let current = match conn.prepare_cached(
+                "SELECT table_name FROM node_interest WHERE actor_id = crsql_site_id()",
+            ) {
+                Ok(mut stmt) => stmt
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<BTreeSet<_>, _>>()?,
+                // node_interest may not be defined (fail-soft, same as boot readers).
+                Err(e) if e.to_string().contains("no such table: node_interest") => {
+                    BTreeSet::new()
+                }
+                Err(e) => return Err(e),
+            };
+            let applied = conn
+                .prepare_cached("SELECT value FROM __corro_state WHERE key = ?")?
+                .query_row([INTEREST_EPOCH_STATE_KEY], |row| row.get::<_, String>(0))
+                .optional()?
+                .and_then(|value| value.parse::<u64>().ok());
+            Ok((applied, current != desired))
+        }),
+        Err(e) => {
+            return reply(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                false,
+                false,
+                0,
+                Some(format!("could not acquire read connection: {e}")),
+            );
+        }
+    };
+    let (applied_epoch, placement_changed) = match precheck {
+        Ok(v) => v,
+        Err(e) => {
+            return reply(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                false,
+                false,
+                0,
+                Some(format!("interest precheck failed: {e}")),
+            );
+        }
+    };
+    if let Err(e) = check_interest_epoch(req.epoch, applied_epoch, placement_changed) {
+        return reply(StatusCode::CONFLICT, false, false, 0, Some(e.to_string()));
+    }
+
+    // ③ hot-swap config: from here sync/reconcile read the new interest scope.
+    // Keep the pre-request Config for rollback on any later failure.
+    let old_config: Config = {
+        let guard = agent.config();
+        (**guard).clone()
+    };
+    let mut new_config = old_config.clone();
+    new_config.gossip.interest = tables.clone();
+    new_config.gossip.interest_epoch = req.epoch;
+    agent.set_config(new_config);
+
+    // ④ reopen history that was previously Cleared while the table was out of
+    // scope. On failure roll the config back and 500.
+    let reopened_ranges = match reopen_filtered_versions_after_interest_expansion(&agent).await {
+        Ok((_reopened_versions, ranges)) => ranges,
+        Err(e) => {
+            agent.set_config(old_config);
+            return reply(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                false,
+                false,
+                0,
+                Some(format!("could not reopen filtered versions: {e}")),
+            );
+        }
+    };
+    let reopened_ranges_count: usize = reopened_ranges
+        .values()
+        .map(|ranges| ranges.iter().count())
+        .sum();
+
+    // ⑤ reconcile self-declared node_interest: additions land active=0, removals
+    // are gated by the min-replica guard, and the epoch is re-checked + persisted
+    // inside the txn. Any failure rolls the config back.
+    let has_pending = match reconcile_own_interest(&agent, live_actor_ids(&agent)).await {
+        Ok(pending) => pending,
+        Err(e) => {
+            agent.set_config(old_config);
+            let msg = e.to_string();
+            // reconcile_own_interest flattens ChangeError into eyre; map the
+            // conflict-class failures (removal guard / epoch fencing) to 409 and
+            // everything else to 500. Substrings match the ChangeError Display.
+            let code = if msg.contains("unsafe interest removal")
+                || msg.contains("stale interest epoch")
+                || msg.contains("was reused for a different placement")
+            {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            return reply(code, false, false, 0, Some(msg));
+        }
+    };
+
+    // ⑥ if anything is pending backfill, spawn the single-flight activation task
+    // (its internal lock serializes against the boot activation task). Mirror the
+    // boot call site's parameter shape (run_root.rs).
+    if has_pending {
+        spawn_counted(activate_pending_interest_when_synced(
+            agent.clone(),
+            agent.bookie().clone(),
+            reopened_ranges,
+            tripwire.clone(),
+        ));
+    }
+
+    // ⑦ success.
+    reply(
+        StatusCode::OK,
+        true,
+        has_pending,
+        reopened_ranges_count,
+        None,
+    )
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -291,8 +291,7 @@ async fn wait_for_restored_live_members(
 /// 启动路径经 `wait_for_restored_live_members` 拿到成员集（还要等待恢复的 holder 归队）；
 /// 运行期无需等待恢复，直接从 agent 的成员表现读即可，口径与启动侧一致
 /// （`members().read().states` 的 key 即在线 actor）。
-// 运行期 handler（Task 3 的 `POST /v1/interest`）尚未接线，先暴露供其调用。
-#[allow(dead_code)]
+// 运行期 handler（`POST /v1/interest`，见 api/public/mod.rs）在改动 placement 前现读成员集。
 pub(crate) fn live_actor_ids(agent: &Agent) -> BTreeSet<ActorId> {
     agent
         .members()
@@ -303,7 +302,7 @@ pub(crate) fn live_actor_ids(agent: &Agent) -> BTreeSet<ActorId> {
         .collect::<BTreeSet<_>>()
 }
 
-const INTEREST_EPOCH_STATE_KEY: &str = "interest_epoch_v1";
+pub(crate) const INTEREST_EPOCH_STATE_KEY: &str = "interest_epoch_v1";
 
 pub(crate) fn check_interest_epoch(
     configured: u64,

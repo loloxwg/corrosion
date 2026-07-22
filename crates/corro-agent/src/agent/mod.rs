@@ -10,7 +10,7 @@ mod error;
 mod handlers;
 mod metrics;
 mod reaper;
-mod run_root;
+pub(crate) mod run_root;
 mod setup;
 mod uni;
 pub mod util;

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     net::SocketAddr,
     ops::{Deref, RangeInclusive},
     time::{Duration, Instant},
@@ -24,11 +24,11 @@ use uuid::Uuid;
 use crate::{
     agent::{
         process_multiple_changes,
-        util::{apply_pending_ddl, execute_schema_from_paths, DDL_APPLIED_SEQ_KEY},
+        util::{apply_pending_ddl, execute_schema, execute_schema_from_paths, DDL_APPLIED_SEQ_KEY},
     },
     api::{
         peer::parallel_sync,
-        public::{api_v1_transactions, SchemaResponse, TimeoutParams},
+        public::{api_v1_transactions, InterestResponse, SchemaResponse, TimeoutParams},
     },
     transport::Transport,
 };
@@ -1937,6 +1937,214 @@ async fn runtime_schema_api() -> eyre::Result<()> {
 
     tripwire_off_tx.send(()).await.ok();
     tripwire_off_worker.await;
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_interest_api() -> eyre::Result<()> {
+    _ = tracing_subscriber::fmt::try_init();
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+
+    let ta = launch_test_agent(
+        |conf| conf.api_allow_runtime_interest(true).build(),
+        tripwire.clone(),
+    )
+    .await?;
+
+    // node_interest is user-provided schema; a real deployment ships it in its
+    // schema files. Inject it at runtime so the placement reconcile has a table
+    // to write. (Boot reconcile already ran as a no-op with empty interest.)
+    execute_schema(
+        &ta.agent,
+        vec!["CREATE TABLE node_interest (actor_id BLOB NOT NULL, table_name TEXT NOT NULL, \
+              active INTEGER NOT NULL DEFAULT 1, PRIMARY KEY (actor_id, table_name))"
+            .to_string()],
+    )
+    .await?;
+
+    let client = reqwest::Client::new();
+    let api_addr = ta.agent.api_addr();
+    let post = |body: serde_json::Value| {
+        let client = client.clone();
+        let url = format!("http://{api_addr}/v1/interest");
+        async move {
+            client
+                .post(url)
+                .header(hyper::header::CONTENT_TYPE, "application/json")
+                .body(serde_json::to_vec(&body).unwrap())
+                .send()
+                .await
+        }
+    };
+
+    // 1. flag off on a different node -> 403, no config change.
+    {
+        let (tw_off, tw_off_worker, tw_off_tx) = Tripwire::new_simple();
+        let ta_off = launch_test_agent(|conf| conf.build(), tw_off.clone()).await?;
+        let res = client
+            .post(format!("http://{}/v1/interest", ta_off.agent.api_addr()))
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(serde_json::to_vec(&serde_json::json!({"tables": ["tests"], "epoch": 1}))?)
+            .send()
+            .await?;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let body: InterestResponse = serde_json::from_slice(&res.bytes().await?)?;
+        assert!(!body.accepted);
+        assert!(body.error.unwrap().contains("allow_runtime_interest"));
+        assert!(ta_off.agent.config().gossip.interest.is_empty());
+        tw_off_tx.send(()).await.ok();
+        tw_off_worker.await;
+    }
+
+    // 2. epoch 0 -> 400.
+    {
+        let res = post(serde_json::json!({"tables": ["tests"], "epoch": 0})).await?;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body: InterestResponse = serde_json::from_slice(&res.bytes().await?)?;
+        assert!(!body.accepted);
+        assert!(body.error.unwrap().contains("epoch"));
+    }
+
+    // 3. empty tables -> 400 (must use ["*"] explicitly).
+    {
+        let res = post(serde_json::json!({"tables": [], "epoch": 1})).await?;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body: InterestResponse = serde_json::from_slice(&res.bytes().await?)?;
+        assert!(!body.accepted);
+        assert!(body.error.unwrap().contains("non-empty"));
+    }
+
+    // 4. valid expansion -> 200; config hot-swapped, node_interest self rows
+    //    written (active=0 pending), applied epoch persisted.
+    {
+        let res = post(serde_json::json!({"tables": ["tests", "newtable_x"], "epoch": 1})).await?;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: InterestResponse = serde_json::from_slice(&res.bytes().await?)?;
+        assert!(body.accepted);
+        assert!(
+            body.pending_activation,
+            "both newly-added tables land active=0 pending backfill"
+        );
+        assert!(body.error.is_none());
+
+        // config scope swapped (order-insensitive)
+        let interest: BTreeSet<String> =
+            ta.agent.config().gossip.interest.iter().cloned().collect();
+        assert_eq!(
+            interest,
+            BTreeSet::from(["tests".to_string(), "newtable_x".to_string()])
+        );
+        assert_eq!(ta.agent.config().gossip.interest_epoch, 1);
+
+        let conn = ta.agent.pool().read().await?;
+        let rows: BTreeSet<String> = conn
+            .prepare("SELECT table_name FROM node_interest WHERE actor_id = crsql_site_id()")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        assert_eq!(
+            rows,
+            BTreeSet::from(["tests".to_string(), "newtable_x".to_string()]),
+            "self placement rows present for both tables"
+        );
+        let applied: String = conn.query_row(
+            "SELECT value FROM __corro_state WHERE key = 'interest_epoch_v1'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(applied, "1", "applied epoch persisted");
+    }
+
+    // 5. epoch replay: same epoch, changed placement -> 409 (ReusedInterestEpoch).
+    //    The pending row must survive the rejection.
+    {
+        let res = post(serde_json::json!({"tables": ["tests"], "epoch": 1})).await?;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let body: InterestResponse = serde_json::from_slice(&res.bytes().await?)?;
+        assert!(!body.accepted);
+        // config unchanged (rollback / never-swapped)
+        let interest: BTreeSet<String> =
+            ta.agent.config().gossip.interest.iter().cloned().collect();
+        assert_eq!(
+            interest,
+            BTreeSet::from(["tests".to_string(), "newtable_x".to_string()]),
+            "rejected replay leaves interest scope untouched"
+        );
+        let conn = ta.agent.pool().read().await?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM node_interest \
+             WHERE actor_id = crsql_site_id() AND table_name = 'newtable_x'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(count, 1, "newtable_x row still present after 409");
+    }
+
+    // 6. epoch bump with unchanged placement -> 200 (monotonic; applied -> 2).
+    {
+        let res = post(serde_json::json!({"tables": ["tests", "newtable_x"], "epoch": 2})).await?;
+        assert_eq!(res.status(), StatusCode::OK);
+        let conn = ta.agent.pool().read().await?;
+        let applied: String = conn.query_row(
+            "SELECT value FROM __corro_state WHERE key = 'interest_epoch_v1'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(applied, "2");
+    }
+
+    // 7. epoch regression: lower epoch than applied -> 409 (StaleInterestEpoch).
+    {
+        let res =
+            post(serde_json::json!({"tables": ["tests", "newtable_x", "tests2"], "epoch": 1}))
+                .await?;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let body: InterestResponse = serde_json::from_slice(&res.bytes().await?)?;
+        assert!(!body.accepted);
+        assert_eq!(ta.agent.config().gossip.interest_epoch, 2, "epoch not regressed");
+    }
+
+    // 8. removal below min replicas: mark `tests` ready (active=1) with no other
+    //    holders, then try to drop it -> 409 InterestRemovalUnsafe, row survives.
+    {
+        {
+            let conn = ta.agent.pool().write_priority().await?;
+            conn.execute(
+                "UPDATE node_interest SET active = 1 \
+                 WHERE actor_id = crsql_site_id() AND table_name = 'tests'",
+                [],
+            )?;
+        }
+        let res = post(serde_json::json!({"tables": ["newtable_x"], "epoch": 3})).await?;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let body: InterestResponse = serde_json::from_slice(&res.bytes().await?)?;
+        assert!(!body.accepted);
+        assert!(
+            body.error.unwrap().contains("unsafe interest removal"),
+            "removal guard reason surfaced"
+        );
+        // config rolled back to the epoch-2 scope
+        let interest: BTreeSet<String> =
+            ta.agent.config().gossip.interest.iter().cloned().collect();
+        assert_eq!(
+            interest,
+            BTreeSet::from(["tests".to_string(), "newtable_x".to_string()]),
+            "failed removal rolls config back"
+        );
+        assert_eq!(ta.agent.config().gossip.interest_epoch, 2);
+        let conn = ta.agent.pool().read().await?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM node_interest \
+             WHERE actor_id = crsql_site_id() AND table_name = 'tests'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(count, 1, "unsafely-removed table row must survive");
+    }
 
     tripwire_tx.send(()).await.ok();
     tripwire_worker.await;
