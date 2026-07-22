@@ -2403,6 +2403,187 @@ async fn runtime_interest_expansion_backfills() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Regression for the multi-foreign-table expansion defect: when a node with
+/// filtered history from MORE THAN ONE foreign table adopts only SOME of them,
+/// the reopen reopens ALL filtered ranges (the ledger stores actor+version, not
+/// table). The ranges for the STILL-unwanted table must re-close via the
+/// sender's `Changeset::Empty`, otherwise `reopened_ranges_are_complete` never
+/// satisfies and the adopted table never activates.
+///
+/// Shape: A authors BOTH `tests2` (B will adopt) and `tests3` (B will NOT adopt)
+/// before B joins, so B filters both. B expands `["tests"] -> ["tests","tests2"]`.
+/// Expected: `tests2` backfills + activates, the reopened `tests3` gap re-closes
+/// via Empty, and `__corro_filtered_version_ranges` re-records the `tests3` range
+/// so a later second expansion could still backfill it.
+#[tokio::test(flavor = "multi_thread")]
+async fn runtime_interest_expansion_closes_residual_foreign_gaps() -> eyre::Result<()> {
+    _ = tracing_subscriber::fmt::try_init();
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+
+    let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+    execute_schema(
+        &ta1.agent,
+        vec!["CREATE TABLE node_interest (actor_id BLOB NOT NULL, table_name TEXT NOT NULL, \
+              active INTEGER NOT NULL DEFAULT 1, PRIMARY KEY (actor_id, table_name))"
+            .to_string()],
+    )
+    .await?;
+
+    let client = reqwest::Client::new();
+    let a_api = ta1.agent.api_addr();
+
+    // A writes tests2 (adopted later) and tests3 (stays foreign) BEFORE B joins,
+    // so B can only learn them via sync (filtered to empty), never a live bcast.
+    const N: i64 = 4;
+    for (table, n) in [("tests2", N), ("tests3", N)] {
+        for i in 0..n {
+            let body: Vec<Statement> = serde_json::from_value(json!([[
+                format!("INSERT INTO {table} (id, text) VALUES (?, ?)"),
+                [i, format!("{table}-{i}")]
+            ]]))?;
+            let res = client
+                .post(format!("http://{a_api}/v1/transactions"))
+                .header(hyper::header::CONTENT_TYPE, "application/json")
+                .body(serde_json::to_vec(&body)?)
+                .send()
+                .await?;
+            assert_eq!(res.status(), StatusCode::OK);
+        }
+    }
+    let a_actor = ta1.agent.actor_id();
+    sleep(Duration::from_secs(2)).await;
+
+    // B: narrow static interest ["tests"] + scored_reduce; runtime interest on.
+    let ta2 = launch_test_agent(
+        |conf| {
+            conf.bootstrap(vec![ta1.agent.gossip_addr().to_string()])
+                .gossip_interest(vec!["tests".to_string()])
+                .broadcast_strategy(BroadcastStrategy::ScoredReduce)
+                .api_allow_runtime_interest(true)
+                .build()
+        },
+        tripwire.clone(),
+    )
+    .await?;
+    execute_schema(
+        &ta2.agent,
+        vec!["CREATE TABLE node_interest (actor_id BLOB NOT NULL, table_name TEXT NOT NULL, \
+              active INTEGER NOT NULL DEFAULT 1, PRIMARY KEY (actor_id, table_name))"
+            .to_string()],
+    )
+    .await?;
+
+    // Wait until B has filtered A's tests2+tests3 versions AND applied neither.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (filtered, t2, t3) = {
+            let conn = ta2.agent.pool().read().await?;
+            let filtered: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM __corro_filtered_version_ranges WHERE actor_id = ?",
+                [a_actor],
+                |r| r.get(0),
+            )?;
+            let t2: i64 = conn.query_row("SELECT COUNT(*) FROM tests2", [], |r| r.get(0))?;
+            let t3: i64 = conn.query_row("SELECT COUNT(*) FROM tests3", [], |r| r.get(0))?;
+            (filtered, t2, t3)
+        };
+        assert_eq!(t2, 0, "B must not hold tests2 while filtered");
+        assert_eq!(t3, 0, "B must not hold tests3 while filtered");
+        if filtered > 0 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("B never recorded filtered versions from A");
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+
+    // Expand B to adopt tests2 only. tests3 stays foreign.
+    let b_api = ta2.agent.api_addr();
+    let res = client
+        .post(format!("http://{b_api}/v1/interest"))
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(serde_json::to_vec(
+            &json!({"tables": ["tests", "tests2"], "epoch": 1}),
+        )?)
+        .send()
+        .await?;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: InterestResponse = serde_json::from_slice(&res.bytes().await?)?;
+    assert!(body.accepted);
+    assert!(body.reopened_ranges > 0, "must reopen filtered ranges");
+    assert!(body.pending_activation);
+
+    // tests2 backfills AND activates. Activation firing PROVES the reopened
+    // range (which also spans the still-foreign tests3 versions) fully closed —
+    // i.e. the tests3 portion re-closed via Empty rather than lingering as a gap.
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let (t2_rows, active_t2) = {
+            let conn = ta2.agent.pool().read().await?;
+            let t2_rows: i64 = conn.query_row("SELECT COUNT(*) FROM tests2", [], |r| r.get(0))?;
+            let active_t2: i64 = conn
+                .query_row(
+                    "SELECT active FROM node_interest \
+                     WHERE actor_id = crsql_site_id() AND table_name = 'tests2'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(-1);
+            (t2_rows, active_t2)
+        };
+        if t2_rows == N && active_t2 == 1 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            // Diagnostic dump of the residual gap that blocks activation.
+            let conn = ta2.agent.pool().read().await?;
+            let gaps: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM __corro_bookkeeping_gaps WHERE actor_id = ?",
+                    [a_actor],
+                    |r| r.get(0),
+                )
+                .unwrap_or(-1);
+            panic!(
+                "tests2 did not backfill+activate: rows={t2_rows} (want {N}), \
+                 active(tests2)={active_t2}; residual A gaps={gaps}"
+            );
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+
+    // The still-foreign tests3 must NOT have been applied (it stays filtered).
+    // And its range must be re-recorded in the filtered ledger so a later second
+    // expansion could still backfill it.
+    {
+        let conn = ta2.agent.pool().read().await?;
+        let t3: i64 = conn.query_row("SELECT COUNT(*) FROM tests3", [], |r| r.get(0))?;
+        assert_eq!(t3, 0, "tests3 stays foreign, must not be applied");
+        let gaps: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM __corro_bookkeeping_gaps WHERE actor_id = ?",
+            [a_actor],
+            |r| r.get(0),
+        )?;
+        assert_eq!(gaps, 0, "no residual needed gaps for A after re-filtering");
+        let filtered: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM __corro_filtered_version_ranges WHERE actor_id = ?",
+            [a_actor],
+            |r| r.get(0),
+        )?;
+        assert!(
+            filtered > 0,
+            "re-filtered tests3 range must be re-recorded in the filtered ledger"
+        );
+    }
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn runtime_ddl_propagates_to_peer() -> eyre::Result<()> {
     _ = tracing_subscriber::fmt::try_init();

@@ -1013,10 +1013,28 @@ pub async fn handle_changes(
                 .versions()
                 .all(|v| seen.contains_key(&(change.actor_id, v)))
             {
-                if matches!(src, ChangeSource::Broadcast) {
-                    counter!("corro.broadcast.duplicate.count", "from" => "cache").increment(1);
+                // A runtime interest expansion reopens previously-filtered ranges,
+                // re-marking those versions as `needed` in the bookie even though
+                // they are still in this in-memory `seen` cache from the first
+                // filtering pass. The sender re-serves them as a `Changeset::Empty`
+                // (no seqs, every version already seen) to close the reopened gap.
+                // Dropping it here would strand the gap forever (the adopted table
+                // never activates) — the `seen` cache is only a best-effort
+                // duplicate suppressor and must defer to the bookie, which is the
+                // authority on what we still need. Only short-circuit when the
+                // bookie does NOT still need any of these versions.
+                let still_needed = bookie.get(&change.actor_id).is_some_and(|booked| {
+                    let booked = booked.read();
+                    change
+                        .versions()
+                        .any(|v| booked.needed().iter().any(|range| range.contains(&v)))
+                });
+                if !still_needed {
+                    if matches!(src, ChangeSource::Broadcast) {
+                        counter!("corro.broadcast.duplicate.count", "from" => "cache").increment(1);
+                    }
+                    continue;
                 }
-                continue;
             }
         }
 
