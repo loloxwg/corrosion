@@ -45,6 +45,7 @@ use corro_types::{
     agent::Agent,
     api::{ColumnName, TableName},
     change::row_to_change,
+    config::BroadcastStrategy,
     pubsub::pack_columns,
 };
 
@@ -2144,6 +2145,255 @@ async fn runtime_interest_api() -> eyre::Result<()> {
             |r| r.get(0),
         )?;
         assert_eq!(count, 1, "unsafely-removed table row must survive");
+    }
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+
+    Ok(())
+}
+
+/// End-to-end proof of the runtime-interest *expansion + backfill* path — the one
+/// existing tests never exercise, because they all run the default `Random`
+/// strategy whose effective sync interest is `["*"]`, so nothing is ever filtered
+/// and the reopen path is a pure no-op.
+///
+/// Here B runs a NON-Random strategy with a narrow static interest, so `tests2`
+/// versions are genuinely filtered and recorded, and expanding B's interest at
+/// runtime must actually reopen those gaps and backfill the history.
+///
+/// Causality (why each side is configured as it is):
+/// * A = `Random`, no interest → the history holder. It keeps every version, and
+///   when it *serves sync* to B it applies interest filtering keyed by the
+///   REQUESTER's declared interest (`handle_need`): B declares `["tests"]`, so A
+///   emits every `tests2` version as `Changeset::Empty`. That empty arrival is the
+///   ONLY way `__corro_filtered_version_ranges` gets populated on B.
+/// * We write `tests2` on A BEFORE B joins the cluster. If B were already a live
+///   member, A's `Random` ring0 broadcast would flood the FULL (non-empty) change
+///   to B, which B would apply outright (broadcast receive has no interest filter)
+///   — defeating the whole premise. Writing pre-membership forces B to obtain
+///   `tests2` exclusively via anti-entropy sync, where A filters it to empty.
+/// * B = `scored_reduce` + interest `["tests"]` (non-Random, non-empty, no `"*"`)
+///   is exactly the predicate that makes both `interest_for_sync` (declare
+///   `["tests"]` on SyncStart) and `sync_interest_is_filtered` (record the empty
+///   arrivals) fire.
+#[tokio::test(flavor = "multi_thread")]
+async fn runtime_interest_expansion_backfills() -> eyre::Result<()> {
+    _ = tracing_subscriber::fmt::try_init();
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+
+    // A: history holder. Default Random strategy, no interest.
+    let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+
+    // node_interest is user-provided schema; inject it on A (rows replicate to B).
+    execute_schema(
+        &ta1.agent,
+        vec!["CREATE TABLE node_interest (actor_id BLOB NOT NULL, table_name TEXT NOT NULL, \
+              active INTEGER NOT NULL DEFAULT 1, PRIMARY KEY (actor_id, table_name))"
+            .to_string()],
+    )
+    .await?;
+
+    let client = reqwest::Client::new();
+    let a_api = ta1.agent.api_addr();
+
+    // A writes several `tests2` versions BEFORE B exists, so B can only learn them
+    // through sync (filtered to empty), never through a live broadcast.
+    const N: i64 = 6;
+    for i in 0..N {
+        let body: Vec<Statement> = serde_json::from_value(json!([[
+            "INSERT INTO tests2 (id, text) VALUES (?, ?)",
+            [i, format!("t2-{i}")]
+        ]]))?;
+        let res = client
+            .post(format!("http://{a_api}/v1/transactions"))
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(serde_json::to_vec(&body)?)
+            .send()
+            .await?;
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+    let a_actor = ta1.agent.actor_id();
+
+    // Drain A's ring0 broadcast buffer to an EMPTY member set before B joins.
+    // `tests2` is non-critical, so its writes flush on the 500ms bcast tick; ring0
+    // broadcasts are ephemeral (never replayed to late joiners). Waiting well past
+    // several ticks guarantees that once B becomes a live member it can obtain
+    // `tests2` ONLY via anti-entropy sync (the filtered path) — not via a live
+    // broadcast of the FULL change, which the receive side would apply unfiltered.
+    sleep(Duration::from_secs(2)).await;
+
+    // B: narrow static interest ["tests"] + scored_reduce; runtime interest enabled.
+    let ta2 = launch_test_agent(
+        |conf| {
+            conf.bootstrap(vec![ta1.agent.gossip_addr().to_string()])
+                .gossip_interest(vec!["tests".to_string()])
+                .broadcast_strategy(BroadcastStrategy::ScoredReduce)
+                .api_allow_runtime_interest(true)
+                .build()
+        },
+        tripwire.clone(),
+    )
+    .await?;
+
+    // node_interest on B is injected AFTER launch, so B's boot reconcile soft-failed
+    // (table absent). That is fine: sync filtering keys off CONFIG interest, not this
+    // table. B's placement rows are written later by the POST /v1/interest reconcile.
+    execute_schema(
+        &ta2.agent,
+        vec!["CREATE TABLE node_interest (actor_id BLOB NOT NULL, table_name TEXT NOT NULL, \
+              active INTEGER NOT NULL DEFAULT 1, PRIMARY KEY (actor_id, table_name))"
+            .to_string()],
+    )
+    .await?;
+
+    // Phase 1 (load-bearing precondition): wait until B has FILTERED A's tests2
+    // versions into __corro_filtered_version_ranges. If this never populates, the
+    // reopen path has nothing to undo and the test degenerates into the very no-op
+    // it exists to rule out — so we assert it, and also assert B did NOT apply the
+    // tests2 rows while its interest excludes them.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (filtered, applied) = {
+            let conn = ta2.agent.pool().read().await?;
+            let filtered: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM __corro_filtered_version_ranges WHERE actor_id = ?",
+                [a_actor],
+                |r| r.get(0),
+            )?;
+            let applied: i64 = conn.query_row("SELECT COUNT(*) FROM tests2", [], |r| r.get(0))?;
+            (filtered, applied)
+        };
+        assert_eq!(
+            applied, 0,
+            "B must not hold tests2 rows while its interest excludes them (filtered={filtered})"
+        );
+        if filtered > 0 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("B never recorded filtered tests2 versions from A");
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+
+    // Phase 2: expand B's interest to include tests2 at epoch 1.
+    let b_api = ta2.agent.api_addr();
+    let res = client
+        .post(format!("http://{b_api}/v1/interest"))
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(serde_json::to_vec(
+            &json!({"tables": ["tests", "tests2"], "epoch": 1}),
+        )?)
+        .send()
+        .await?;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: InterestResponse = serde_json::from_slice(&res.bytes().await?)?;
+    assert!(body.accepted);
+    // ① The reopen actually reopened the filtered tests2 ranges (load-bearing: a
+    //    Random-strategy run would report 0 here — the coverage gap this test closes).
+    assert!(
+        body.reopened_ranges > 0,
+        "interest expansion must reopen the filtered tests2 ranges, got {}",
+        body.reopened_ranges
+    );
+    assert!(
+        body.pending_activation,
+        "newly-added tests2 lands active=0 pending backfill"
+    );
+
+    // ① (cont.) The filtered-version-ranges gap ledger is cleared by the reopen.
+    {
+        let conn = ta2.agent.pool().read().await?;
+        let remaining: i64 =
+            conn.query_row("SELECT COUNT(*) FROM __corro_filtered_version_ranges", [], |r| {
+                r.get(0)
+            })?;
+        assert_eq!(remaining, 0, "reopen must clear __corro_filtered_version_ranges");
+    }
+
+    // ② + ③: poll until the tests2 history has been backfilled onto B AND the
+    // placement rows have been activated (active=1) once the reopened gaps closed.
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let (rows, active_t2, active_t1) = {
+            let conn = ta2.agent.pool().read().await?;
+            let rows: i64 = conn.query_row("SELECT COUNT(*) FROM tests2", [], |r| r.get(0))?;
+            let active_t2: i64 = conn
+                .query_row(
+                    "SELECT active FROM node_interest \
+                     WHERE actor_id = crsql_site_id() AND table_name = 'tests2'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(-1);
+            let active_t1: i64 = conn
+                .query_row(
+                    "SELECT active FROM node_interest \
+                     WHERE actor_id = crsql_site_id() AND table_name = 'tests'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(-1);
+            (rows, active_t2, active_t1)
+        };
+        if rows == N && active_t2 == 1 && active_t1 == 1 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "backfill/activation did not converge: tests2_rows={rows} (want {N}), \
+                 active(tests2)={active_t2} active(tests)={active_t1} (want 1/1)"
+            );
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+
+    // Verify the actual backfilled contents, not just the count.
+    {
+        let conn = ta2.agent.pool().read().await?;
+        for i in 0..N {
+            let text: String = conn.query_row(
+                "SELECT text FROM tests2 WHERE id = ?",
+                [i],
+                |r| r.get(0),
+            )?;
+            assert_eq!(text, format!("t2-{i}"), "backfilled tests2 row {i} content");
+        }
+    }
+
+    // ④: after activation, a NEW realtime tests2 write on A must reach B (B now
+    // holds interest tests2; A's Random broadcast + anti-entropy both deliver it).
+    let body: Vec<Statement> = serde_json::from_value(json!([[
+        "INSERT INTO tests2 (id, text) VALUES (?, ?)",
+        [1000, "t2-live"]
+    ]]))?;
+    let res = client
+        .post(format!("http://{a_api}/v1/transactions"))
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(serde_json::to_vec(&body)?)
+        .send()
+        .await?;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let present: bool = {
+            let conn = ta2.agent.pool().read().await?;
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM tests2 WHERE id = 1000 AND text = 't2-live')",
+                [],
+                |r| r.get(0),
+            )?
+        };
+        if present {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("B did not receive the post-activation realtime tests2 write");
+        }
+        sleep(Duration::from_millis(200)).await;
     }
 
     tripwire_tx.send(()).await.ok();

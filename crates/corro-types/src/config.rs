@@ -505,6 +505,9 @@ pub struct ConfigBuilder {
     disable_gso: bool,
     allow_runtime_schema: bool,
     allow_runtime_interest: bool,
+    gossip_interest: Vec<String>,
+    gossip_interest_epoch: u64,
+    broadcast_strategy: Option<BroadcastStrategy>,
 }
 
 impl ConfigBuilder {
@@ -602,6 +605,24 @@ impl ConfigBuilder {
         self
     }
 
+    /// Set this node's self-declared interest (`gossip.interest`): the tables it cares about.
+    pub fn gossip_interest<V: Into<Vec<String>>>(mut self, interest: V) -> Self {
+        self.gossip_interest = interest.into();
+        self
+    }
+
+    /// Set the interest epoch (`gossip.interest_epoch`) fencing placement changes.
+    pub fn gossip_interest_epoch(mut self, epoch: u64) -> Self {
+        self.gossip_interest_epoch = epoch;
+        self
+    }
+
+    /// Set the broadcast strategy (`gossip.broadcast_strategy`).
+    pub fn broadcast_strategy(mut self, strategy: BroadcastStrategy) -> Self {
+        self.broadcast_strategy = Some(strategy);
+        self
+    }
+
     pub fn build(self) -> Result<Config, ConfigBuilderError> {
         let db_path = self.db_path.ok_or(ConfigBuilderError::DbPathRequired)?;
 
@@ -644,11 +665,11 @@ impl ConfigBuilder {
                 max_mtu: self.max_mtu,
                 disable_gso: self.disable_gso,
                 member_id: self.member_id,
-                broadcast_strategy: BroadcastStrategy::default(),
+                broadcast_strategy: self.broadcast_strategy.unwrap_or_default(),
                 interest_routing: Default::default(),
-                interest: Default::default(),
+                interest: self.gossip_interest,
                 interest_min_replicas: default_interest_min_replicas(),
-                interest_epoch: 0,
+                interest_epoch: self.gossip_interest_epoch,
                 graphrl: None,
                 critical_tables: Default::default(),
             },
