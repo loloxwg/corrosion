@@ -628,7 +628,9 @@ fn reopened_ranges_are_complete(
     })
 }
 
-fn initial_sync_is_complete(agent: &Agent, bookie: &Bookie) -> bool {
+/// The two independent sub-conditions of initial-sync quiescence, returned
+/// separately so a stalled activation task can log which one is unsatisfied.
+fn sync_quiescence(agent: &Agent, bookie: &Bookie) -> (bool, bool) {
     let members_synced = agent
         .members()
         .read()
@@ -640,6 +642,11 @@ fn initial_sync_is_complete(agent: &Agent, bookie: &Bookie) -> bool {
         let booked = booked.read();
         booked.needed().is_empty() && booked.partials.is_empty()
     });
+    (members_synced, bookie_quiescent)
+}
+
+fn initial_sync_is_complete(agent: &Agent, bookie: &Bookie) -> bool {
+    let (members_synced, bookie_quiescent) = sync_quiescence(agent, bookie);
     members_synced && bookie_quiescent
 }
 
@@ -657,6 +664,10 @@ pub(crate) async fn activate_pending_interest_when_synced(
 
     let mut consecutive_quiescent = 0;
     let started = Instant::now();
+    // 卡死可观测性:本任务在等待判据期间独占单飞锁 interest_activation_lock,判据若
+    // 长期不满足会静默阻塞后续所有激活(历史故障模式)。每 ~30s warn 一次当前卡在哪个
+    // 子条件、已等多久。绝不加静默放弃的超时——正确性门不能过期成错误状态。
+    let mut last_stall_warn = Instant::now();
     loop {
         tokio::select! {
             _ = &mut tripwire => return,
@@ -672,6 +683,24 @@ pub(crate) async fn activate_pending_interest_when_synced(
             consecutive_quiescent += 1;
         } else {
             consecutive_quiescent = 0;
+            if last_stall_warn.elapsed() >= Duration::from_secs(30) {
+                last_stall_warn = Instant::now();
+                let waited_secs = started.elapsed().as_secs();
+                if reopened_ranges.is_empty() {
+                    let (members_synced, bookie_quiescent) = sync_quiescence(&agent, &bookie);
+                    warn!(
+                        waited_secs,
+                        members_synced,
+                        bookie_quiescent,
+                        "interest activation still waiting on initial-sync quiescence gate (holding single-flight activation lock)"
+                    );
+                } else {
+                    warn!(
+                        waited_secs,
+                        "interest activation still waiting on reopened-range backfill (holding single-flight activation lock)"
+                    );
+                }
+            }
         }
         if consecutive_quiescent < 2 {
             continue;

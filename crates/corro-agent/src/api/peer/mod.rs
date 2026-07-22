@@ -1226,6 +1226,26 @@ pub async fn parallel_sync(
 
     let len = syncers.len();
 
+    // Every peer whose handshake completed is one we've exchanged sync state with
+    // — a completed round trip — even when we end up needing nothing from them.
+    // Stamp them all as synced now, BEFORE the readers/servers split below (which
+    // drops no-needs peers) and before the caught-up `readers.is_empty() &&
+    // servers.is_empty()` early-return. Otherwise a well-fed node (the seed, or any
+    // fully caught-up node) never marks the peers it has no data to fetch from, so
+    // `members_synced` — the quiescence gate in `initial_sync_is_complete` — can
+    // never become true at cluster scale. That wedges boot-time interest activation
+    // and, via the single-flight interest_activation_lock, runtime
+    // `POST /v1/interest` activation too. "Nothing to fetch" is knowledge, not the
+    // absence of a sync. (Over-stamping here is safe: activation still additionally
+    // requires bookie quiescence, which is the real data-completeness guard.)
+    {
+        let mut members = agent.members().write();
+        let ts = Timestamp::from(agent.clock().new_timestamp());
+        for (actor_id, ..) in syncers.iter() {
+            members.update_sync_ts(actor_id, ts);
+        }
+    }
+
     let (readers, mut servers) = {
         syncers.into_iter().fold(
             (Vec::with_capacity(len), Vec::with_capacity(len)),
@@ -1848,6 +1868,88 @@ mod tests {
                 (CrsqlDbVersion(i)..=CrsqlDbVersion(i)).into()
             );
         }
+
+        Ok(())
+    }
+
+    /// Regression: a completed sync handshake with a peer we need NOTHING from
+    /// must still stamp `last_sync_ts`. Before the fix, no-needs peers were
+    /// dropped from the reader set (and a fully caught-up node early-returns
+    /// before the stamp site), so a well-fed node never marked such peers and
+    /// `members_synced` — the interest-activation quiescence gate in
+    /// `initial_sync_is_complete` — never converged at cluster scale.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn zero_needs_sync_still_stamps_last_sync_ts() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+
+        // A: a real running peer that answers the sync handshake but holds no
+        // data B is interested in, so B computes zero needs against it.
+        let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+
+        // B: built via `setup` (no background sync loop spawned), so the only
+        // sync in this test is the explicit parallel_sync call below.
+        let dir = tempfile::tempdir()?;
+        let (b_agent, b_opts) = setup(
+            Config::builder()
+                .db_path(dir.path().join("corrosion.db").display().to_string())
+                .gossip_addr("127.0.0.1:0".parse()?)
+                .api_addr("127.0.0.1:0".parse()?)
+                .build()?,
+            tripwire.clone(),
+        )
+        .await?;
+
+        // Register A as a member of B so update_sync_ts has a state to stamp
+        // (it is a no-op for unknown actors). Match B's member_id so add_member
+        // accepts the entry.
+        let a_id = ta1.agent.actor_id();
+        let a_addr = ta1.agent.gossip_addr();
+        {
+            let ts = corro_types::broadcast::Timestamp::from(b_agent.clock().new_timestamp());
+            let actor = corro_types::actor::Actor::new(
+                a_id,
+                a_addr,
+                ts,
+                b_agent.cluster_id(),
+                b_agent.member_id(),
+            );
+            b_agent.members().write().add_member(&actor);
+        }
+        assert!(
+            b_agent
+                .members()
+                .read()
+                .states
+                .get(&a_id)
+                .unwrap()
+                .last_sync_ts
+                .is_none(),
+            "freshly registered member must start with no last_sync_ts"
+        );
+
+        // Sync round against A, from which B needs nothing.
+        let synced = parallel_sync(
+            &b_agent,
+            &b_opts.transport,
+            vec![(a_id, a_addr)],
+            Default::default(),
+        )
+        .await?;
+        assert_eq!(synced, 0, "B needs nothing from A, so zero changes flow");
+
+        // The completed handshake must still have stamped the peer as synced.
+        assert!(
+            b_agent
+                .members()
+                .read()
+                .states
+                .get(&a_id)
+                .unwrap()
+                .last_sync_ts
+                .is_some(),
+            "a completed zero-data sync round must stamp last_sync_ts"
+        );
 
         Ok(())
     }
