@@ -286,9 +286,26 @@ async fn wait_for_restored_live_members(
     }
 }
 
+/// 运行期取当前在线成员集合，用于 `reconcile_own_interest` 的摘除副本门禁判定。
+///
+/// 启动路径经 `wait_for_restored_live_members` 拿到成员集（还要等待恢复的 holder 归队）；
+/// 运行期无需等待恢复，直接从 agent 的成员表现读即可，口径与启动侧一致
+/// （`members().read().states` 的 key 即在线 actor）。
+// 运行期 handler（Task 3 的 `POST /v1/interest`）尚未接线，先暴露供其调用。
+#[allow(dead_code)]
+pub(crate) fn live_actor_ids(agent: &Agent) -> BTreeSet<ActorId> {
+    agent
+        .members()
+        .read()
+        .states
+        .keys()
+        .copied()
+        .collect::<BTreeSet<_>>()
+}
+
 const INTEREST_EPOCH_STATE_KEY: &str = "interest_epoch_v1";
 
-fn check_interest_epoch(
+pub(crate) fn check_interest_epoch(
     configured: u64,
     applied: Option<u64>,
     placement_changed: bool,
@@ -397,7 +414,7 @@ async fn load_removal_candidate_actors(agent: &Agent) -> BTreeSet<ActorId> {
     })
 }
 
-async fn reconcile_own_interest(
+pub(crate) async fn reconcile_own_interest(
     agent: &Agent,
     live_actors: BTreeSet<ActorId>,
 ) -> eyre::Result<bool> {
@@ -624,12 +641,18 @@ fn initial_sync_is_complete(agent: &Agent, bookie: &Bookie) -> bool {
     members_synced && bookie_quiescent
 }
 
-async fn activate_pending_interest_when_synced(
+pub(crate) async fn activate_pending_interest_when_synced(
     agent: Agent,
     bookie: Bookie,
     reopened_ranges: BTreeMap<ActorId, RangeInclusiveSet<CrsqlDbVersion>>,
     mut tripwire: Tripwire,
 ) {
+    // 激活任务单飞：等待旧激活任务收尾后再采样判据，避免旧任务的全量
+    // `UPDATE ... WHERE active = 0` 把本任务尚未回填完成的新 pending 行过早激活。
+    // 关键：判据采样（consecutive_quiescent/started 计时）必须在拿到锁之后才开始，
+    // 因此计时器与循环都放在锁获取之后。
+    let _activation_guard = agent.interest_activation_lock().lock().await;
+
     let mut consecutive_quiescent = 0;
     let started = Instant::now();
     loop {
@@ -712,7 +735,7 @@ fn sync_interest_expanded(previous: &[String], current: &[String]) -> bool {
     current.iter().any(|table| !previous.contains(table))
 }
 
-async fn reopen_filtered_versions_after_interest_expansion(
+pub(crate) async fn reopen_filtered_versions_after_interest_expansion(
     agent: &Agent,
 ) -> eyre::Result<(u64, BTreeMap<ActorId, RangeInclusiveSet<CrsqlDbVersion>>)> {
     let current = effective_sync_interest(agent);

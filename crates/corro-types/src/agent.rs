@@ -20,7 +20,7 @@ use serde_json::json;
 use sqlite_pool::SqliteConn;
 use tokio::{
     runtime::Handle,
-    sync::{oneshot, Semaphore},
+    sync::{oneshot, Mutex, Semaphore},
 };
 use tokio::{
     sync::{AcquireError, OwnedSemaphorePermit},
@@ -114,6 +114,10 @@ pub struct AgentInner {
     updates_manager: UpdatesManager,
     fatal_issue: Arc<OnceLock<String>>,
     shutdown_token: CancellationToken,
+    // 串行化 node_interest 激活任务（启动激活 vs 运行期热更新触发的激活）。
+    // 旧激活任务的 UPDATE 是全量 `WHERE actor_id=me AND active=0`，若新旧并发，旧任务可能
+    // 在新 pending 行回填完成前过早激活它；串行化让新任务在锁内重新判定回填完成，消除此风险。
+    interest_activation_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +154,7 @@ impl Agent {
             updates_manager: config.updates_manager,
             fatal_issue: config.fatal_issue,
             shutdown_token: config.shutdown_token,
+            interest_activation_lock: Arc::new(Mutex::new(())),
         }))
     }
 
@@ -234,6 +239,13 @@ impl Agent {
 
     pub fn members(&self) -> &RwLock<Members> {
         &self.0.members
+    }
+
+    /// 序列化 node_interest 激活任务（启动激活与运行期热更新触发的激活互斥）。
+    /// 任务体开头 `let _g = agent.interest_activation_lock().lock().await;`，等待旧任务收尾后
+    /// 在锁内重新判定回填完成，避免旧任务全量 UPDATE 过早激活新 pending 行。
+    pub fn interest_activation_lock(&self) -> &Arc<Mutex<()>> {
+        &self.0.interest_activation_lock
     }
 
     pub fn schema(&self) -> &RwLock<Schema> {
