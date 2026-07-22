@@ -44,8 +44,13 @@ SQLite 事务提交
 > [runtime-ddl-design](runtime-ddl-design.md)。本体每 ObjectType 绑一张表的
 > 运行期落地通道已打通(ontology-web `ensure_type_table` 直连此 API)。
 
-- 任务或本体自动生成 `gossip.interest`。
-- 进程运行期间通过 API/Consul watch 热更新 interest(注意:**schema 热更已可**,interest 热更仍未做)。
+> 更新(2026-07-22):**运行期 interest 热更新已实现**——`POST /v1/interest {tables, epoch}`
+> 在单飞+epoch fencing 下热换本节点 interest:先 ArcSwap 热换 config(闭合 sync 侧口径分裂)
+> → 重开被过滤历史 → reconcile(active 门控+摘除门禁)→ 异步回填后激活。这是未来
+> InterestPlan 的执行通道。设计与边界见 [runtime-interest-design](runtime-interest-design.md)。
+
+- 任务或本体自动生成 `gossip.interest`(→ 生成后经 `/v1/interest` 下发的通道已具备)。
+- Consul watch 触发 interest 热更新(API 已可,watch 集成未做)。
 - RL/GNN 自动改变长期 placement。
 - 按 `mission_id`、区域、目标类别、优先级或任意语义谓词过滤行。
 - Corrosion 内置的无人机任务执行器、执行权仲裁或 exactly-once 外部动作。

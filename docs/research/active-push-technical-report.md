@@ -289,3 +289,37 @@ Replication**；**Task-driven Semantic Replication** 是下一阶段演进方向
   会 seq 主键碰撞、LWW 静默丢失且无空洞信号,靠部署约定(仅控制面开 flag)保证;
   本地 apply 与日志写为两事务,崩溃窗口靠调用方重试(幂等)收敛;用户 schema 文件
   若定义保留表,与既有 schema 错误一致为软失败记日志。
+
+### 7.2 已落地第二步:运行期 interest 热更新(2026-07-22)
+
+任务/本体驱动 placement(未来 InterestPlan)的执行通道。`POST /v1/interest {tables, epoch}`
+(配置门 `api.allow_runtime_interest`,默认关)运行期变更本节点 interest,完整复用启动期
+安全协议,不重启:
+
+- **机制**:epoch fencing 预检(单调,重放/回退 409)→ **ArcSwap 热换 config**(sync 侧
+  `interest_for_sync`/过滤判定每次调用现读 config → 即时切到新口径,**闭合了此前
+  「对账读静态配置、推送/查询读 node_interest 表」的口径分裂**)→ 重开
+  `__corro_filtered_version_ranges` 中被过滤的历史版本(gap 重开交 anti-entropy 回填)
+  → `reconcile_own_interest`(新增表 active=0 不对外服务;摘除表 ready holder 不足
+  `interest_min_replicas` 整体拒绝)→ 异步激活任务(回填完成+静默 2 连击才置 active=1,
+  单飞锁串行化防过早激活)。任一步失败 config 回滚,node_interest/epoch 事务性不半写。
+- **实测**:Rust e2e ①扩 interest 后被过滤历史全量回填+激活+实时接收(scored_reduce
+  真过滤路径,非 Random 平凡态);②残留外表 gap 经 Empty 关闭且 ledger 重登记
+  (二次扩张仍可回填)。harness 6 节点五场景(部分复制成立/运行期扩张回填激活/
+  唯一副本摘除 409/epoch 回退 409/越权 403)两连全过 ~25s。
+- **★harness 上规模挖出并修复两个产品级正确性 bug**(2 节点 Rust 测试均探不到):
+  ① `last_sync_ts` 只在出站 sync 真取到数据时打戳 → 「全员已 sync」判据在 ≥4 节点
+  永不可达 → 启动激活任务死循环且持单飞锁堵死运行期激活;修:**完成一轮 sync 即打戳**
+  (无货可取也是知识),真正的数据守门员是 `bookie_quiescent`(needed 非空即不激活)。
+  ② 重开的外表 gap 收不拢:ingest `seen` 缓存把重发的 `Changeset::Empty` 短路(首轮
+  过滤已缓存版本号),权威的 bookie needed 检查永远轮不到;修:no-seqs 变更 seen 命中时
+  查 bookie,仍 needed 则放行(15 行,Full 变更去重快路径零影响,与未知表豁免按构造
+  不相交)。**方法学注脚:与 DDL 轮的 seen 缓存丢版本 bug 同构——「尽力而为的缓存
+  必须让位于权威账本」在本轮第二次应验;规模敏感缺陷只有上规模才现形。**
+- **诚实边界**:重启不持久化——调用方(未来 InterestPlan 控制器)负责同步配置文件,
+  不同步则重启时 epoch fencing **拒绝启动**(响亮失败防静默回退,特性非缺陷);绕过
+  API 手写 node_interest 表不受支持(口径统一只覆盖 API 路径);推送路由 3s 缓存窗口
+  方向性无害;广播接收路径无 interest 过滤(多存不丢,回填正确性只依赖
+  filtered-ranges ledger + anti-entropy,接收端过滤是优化非前提);SWIM 刚死未判 Down
+  的节点短暂计入 ready holder(摘除门禁固有时延,与启动路径一致);激活无超时上限,
+  历史持有者全离线时 pending 长期不激活(监控靠 active=0 行 + 30s 停滞告警日志)。

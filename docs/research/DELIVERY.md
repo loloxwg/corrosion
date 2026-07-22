@@ -105,7 +105,13 @@ release 已确认单节点 39,234 QPS；独立起压器复核后 20 核机台稳
   [runtime-ddl-design](runtime-ddl-design.md) + [runtime-ddl-plan](runtime-ddl-plan.md)(**运行期集群建表,已实现**:
   `POST /v1/schema` → `corro_ddl_log` CRR 分发 → 顺序幂等应用;证据 `crates/corro-agent` 测试
   `runtime_schema_api`/`ddl_log_applies_in_order_and_parks_on_gap`/`runtime_ddl_propagates_to_peer` +
-  `research/harness/ddl_runtime_test.py`(6 节点健康/断链多跳/后入网/越权 403 四场景,25~29s 收敛))。
+  `research/harness/ddl_runtime_test.py`(6 节点健康/断链多跳/后入网/越权 403 四场景,25~29s 收敛))、
+  [runtime-interest-design](runtime-interest-design.md) + [runtime-interest-plan](runtime-interest-plan.md)
+  (**运行期 interest 热更新,已实现**:`POST /v1/interest` 热换 config 闭合口径分裂 + 重开被过滤
+  历史 + active 门控激活;证据测试 `runtime_interest_api`/`runtime_interest_expansion_backfills`/
+  `runtime_interest_expansion_closes_residual_foreign_gaps`/`zero_needs_sync_still_stamps_last_sync_ts` +
+  `research/harness/interest_hot_update_test.py`(6 节点五场景两连过 ~25s;上规模挖出并修复
+  last_sync_ts 打戳语义、seen 缓存短路 Empty 两个产品级 bug,报告 §7.2))。
 - **harness 基础**:`research/harness/run.py`(mission 拓扑 + 配置生成 + 度量)。
 - **教学原型**:`sandbox/gossipdb/`(200 行 HLC/CRDT/SWIM/对账,吃透 corrosion 用,非生产)。
 
