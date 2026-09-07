@@ -118,7 +118,6 @@ pub enum Command {
 pub enum SyncCommand {
     Generate,
     Confirm,
-    ConfirmAll,
     ReconcileGaps,
     CheckBookieConsistency,
 }
@@ -199,7 +198,7 @@ type FramedStream = Framed<
 
 /// Confirm receipt AND application of frontiers actually advertised by peers.
 /// This is a local observation barrier, not a global snapshot or consensus.
-async fn confirm_sync(agent: &Agent, bookie: &Bookie, all_members: bool) -> eyre::Result<serde_json::Value> {
+async fn confirm_sync(agent: &Agent, bookie: &Bookie) -> eyre::Result<serde_json::Value> {
     let config = agent.config();
     if !config.gossip.interest.is_empty() && !config.gossip.interest.iter().any(|v| v == "*") {
         eyre::bail!("sync confirm requires a full-replica interest configuration");
@@ -241,11 +240,7 @@ async fn confirm_sync(agent: &Agent, bookie: &Bookie, all_members: bool) -> eyre
                     observation.addr == *addr && observation.observed_at >= started
                 })
             };
-            let observed = if all_members {
-                expected.iter().all(fresh)
-            } else {
-                expected.is_empty() || expected.iter().any(fresh)
-            };
+            let observed = expected.is_empty() || expected.iter().any(fresh);
             observed && frontiers.values().all(|state| local.compute_available_needs(state).is_empty())
         };
         if (!needs_peer || !expected.is_empty())
@@ -254,7 +249,7 @@ async fn confirm_sync(agent: &Agent, bookie: &Bookie, all_members: bool) -> eyre
             && local.partial_need.is_empty()
         {
             return Ok(
-                json!({"confirmed": true, "peer_count": expected.len(), "observed_peer_count": frontiers.len(), "all_members": all_members, "scope": "observed_peer_frontiers"}),
+                json!({"confirmed": true, "peer_count": expected.len(), "observed_peer_count": frontiers.len(), "scope": "observed_peer_frontiers"}),
             );
         }
         if started.elapsed() > Duration::from_secs(60) {
@@ -305,7 +300,7 @@ async fn handle_conn(
                     }
                     send_success(&mut stream).await;
                 }
-                Command::Sync(command @ (SyncCommand::Confirm | SyncCommand::ConfirmAll)) => match confirm_sync(&agent, bookie, matches!(command, SyncCommand::ConfirmAll)).await {
+                Command::Sync(SyncCommand::Confirm) => match confirm_sync(&agent, bookie).await {
                     Ok(result) => {
                         send(&mut stream, Response::Json(result)).await;
                         send_success(&mut stream).await;
