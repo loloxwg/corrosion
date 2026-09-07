@@ -432,6 +432,7 @@ pub async fn sync_loop(agent: Agent, bookie: Bookie, transport: Transport, mut t
             biased;
 
             _ = &mut next_sync_at => {},
+            _ = agent.sync_requested().notified() => {},
             _ = &mut tripwire => {
                 break;
             }

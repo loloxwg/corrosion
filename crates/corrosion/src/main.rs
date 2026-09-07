@@ -490,6 +490,13 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             ))
             .await?;
         }
+        Command::Sync(SyncCommand::Confirm) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Sync(
+                corro_admin::SyncCommand::Confirm,
+            ))
+            .await?;
+        }
         Command::Sync(SyncCommand::ReconcileGaps) => {
             let mut conn = AdminConn::connect(cli.admin_path()).await?;
             conn.send_command(corro_admin::Command::Sync(
@@ -785,6 +792,8 @@ enum ConsulCommand {
 enum SyncCommand {
     /// Generate a sync message from the current agent
     Generate,
+    /// Confirm local application of fresh native peer frontiers (full replicas only).
+    Confirm,
     /// Check in-memory bookie state against DB-loaded bookie state
     CheckBookieConsistency,
     ReconcileGaps,

@@ -68,6 +68,20 @@ impl Extractor for SyncTraceContextV1 {
 
 pub type SyncRequestV1 = Vec<(ActorId, Vec<SyncNeedV1>)>;
 
+/// A received native handshake, not a claim that queued changes are applied.
+#[derive(Debug, Clone)]
+pub struct SyncObservation {
+    pub observed_at: std::time::Instant,
+    pub addr: std::net::SocketAddr,
+    pub state: SyncStateV1,
+}
+
+impl SyncObservation {
+    pub fn applied_since(&self, local: &SyncStateV1, since: std::time::Instant) -> bool {
+        self.observed_at >= since && local.compute_available_needs(&self.state).is_empty()
+    }
+}
+
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Readable, Writable)]
 pub enum SyncRejectionV1 {
     #[error("max concurrency reached")]
@@ -373,6 +387,26 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    #[test]
+    fn sync_observation_requires_fresh_handshake_and_applied_frontier() {
+        let started = std::time::Instant::now();
+        let peer = ActorId(Uuid::new_v4());
+        let mut local = SyncStateV1::default();
+        let mut observation = SyncObservation {
+            observed_at: started,
+            addr: "127.0.0.1:8787".parse().unwrap(),
+            state: SyncStateV1::default(),
+        };
+        assert!(observation.applied_since(&local, started)); // genuinely empty reply
+        assert!(!observation.applied_since(&local, started + std::time::Duration::from_nanos(1)));
+        observation.state.heads.insert(peer, CrsqlDbVersion(2));
+        assert!(!observation.applied_since(&local, started)); // received, not applied
+        local.heads.insert(peer, CrsqlDbVersion(2));
+        assert!(observation.applied_since(&local, started));
+        local.need.insert(peer, vec![dbvri!(1, 1)]);
+        assert!(!observation.applied_since(&local, started)); // missing earlier version
+    }
 
     #[test]
     fn test_compute_available_needs() {

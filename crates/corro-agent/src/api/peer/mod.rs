@@ -1132,6 +1132,7 @@ pub async fn parallel_sync(
                     let (mut tx, rx) = transport.open_bi(*addr).await?;
                     let mut read = FramedRead::new(rx, LengthDelimitedCodec::builder().max_frame_length(100 * 1_024 * 1_024).new_codec());
 
+                    let observation_started = std::time::Instant::now();
                     encode_write_bipayload_msg(
                         &mut codec,
                         &mut encode_buf,
@@ -1180,6 +1181,10 @@ pub async fn parallel_sync(
                         None => return Err(SyncRecvError::UnexpectedEndOfStream.into()),
                     }
                     trace!(%actor_id, self_actor_id = %agent.actor_id(), "read clock payload");
+
+                    agent.sync_observations().write().insert(actor_id, corro_types::sync::SyncObservation {
+                        observed_at: observation_started, addr: *addr, state: their_sync_state.clone(),
+                    });
 
                     counter!("corro.sync.client.member", "traffic" => "sync").increment(1);
 
@@ -1623,9 +1628,15 @@ pub async fn serve_sync(
     // 发起方(拉取方)声明的 interest → 版本级过滤的依据。None=全量(上游行为)。
     let their_interest = interest_set(&their_interest);
     tokio::spawn(
-        process_sync(agent.pool().clone(), bookie.clone(), tx, rx_need, their_interest)
-            .instrument(info_span!("process_sync"))
-            .inspect_err(|e| error!("could not process sync request: {e}")),
+        process_sync(
+            agent.pool().clone(),
+            bookie.clone(),
+            tx,
+            rx_need,
+            their_interest,
+        )
+        .instrument(info_span!("process_sync"))
+        .inspect_err(|e| error!("could not process sync request: {e}")),
     );
 
     let (send_res, recv_res) = tokio::join!(

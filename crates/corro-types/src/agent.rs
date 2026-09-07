@@ -90,6 +90,9 @@ pub struct AgentConfig {
 }
 
 pub struct AgentInner {
+    peer_sync_observations:
+        RwLock<std::collections::HashMap<ActorId, crate::sync::SyncObservation>>,
+    sync_requested: tokio::sync::Notify,
     actor_id: ActorId,
     pool: SplitPool,
     config: ArcSwap<Config>,
@@ -122,8 +125,18 @@ pub struct Limits {
 }
 
 impl Agent {
+    pub fn sync_requested(&self) -> &tokio::sync::Notify {
+        &self.0.sync_requested
+    }
+    pub fn sync_observations(
+        &self,
+    ) -> &RwLock<std::collections::HashMap<ActorId, crate::sync::SyncObservation>> {
+        &self.0.peer_sync_observations
+    }
     pub fn new(config: AgentConfig) -> Self {
         Self(Arc::new(AgentInner {
+            peer_sync_observations: RwLock::new(Default::default()),
+            sync_requested: tokio::sync::Notify::new(),
             actor_id: config.actor_id,
             pool: config.pool,
             config: config.config,

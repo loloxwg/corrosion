@@ -117,6 +117,7 @@ pub enum Command {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SyncCommand {
     Generate,
+    Confirm,
     ReconcileGaps,
     CheckBookieConsistency,
 }
@@ -195,6 +196,55 @@ type FramedStream = Framed<
     Json<Command, Response>,
 >;
 
+/// Confirm receipt AND application of frontiers actually advertised by peers.
+/// This is a local observation barrier, not a global snapshot or consensus.
+async fn confirm_sync(agent: &Agent, bookie: &Bookie) -> eyre::Result<serde_json::Value> {
+    let config = agent.config();
+    if !config.gossip.interest.is_empty() && !config.gossip.interest.iter().any(|v| v == "*") {
+        eyre::bail!("sync confirm requires a full-replica interest configuration");
+    }
+    let needs_peer = !config.gossip.bootstrap.is_empty();
+    drop(config);
+    let started = Instant::now();
+    loop {
+        let mut expected = HashMap::new();
+        {
+            let members = agent.members().read();
+            for (id, state) in &members.states {
+                if *id != agent.actor_id()
+                    && state.cluster_id == agent.cluster_id()
+                    && state.member_id == agent.member_id()
+                {
+                    expected.insert(*id, state.addr);
+                }
+            }
+        }
+        let local = generate_sync(bookie, agent.actor_id()).await;
+        let peers_applied = {
+            let observations = agent.sync_observations().read();
+            expected.iter().all(|(id, addr)| {
+                observations.get(id).is_some_and(|observation| {
+                    observation.addr == *addr && observation.applied_since(&local, started)
+                })
+            })
+        };
+        if (!needs_peer || !expected.is_empty())
+            && peers_applied
+            && local.need.is_empty()
+            && local.partial_need.is_empty()
+        {
+            return Ok(
+                json!({"confirmed": true, "peer_count": expected.len(), "scope": "observed_peer_frontiers"}),
+            );
+        }
+        if started.elapsed() > Duration::from_secs(60) {
+            eyre::bail!("sync confirmation timed out: peer_count={}, peers_applied={}, missing_versions={}, partial_actors={}", expected.len(), peers_applied, local.need_len(), local.partial_need.len());
+        }
+        agent.sync_requested().notify_one();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 async fn handle_conn(
     agent: Agent,
     bookie: &Bookie,
@@ -235,6 +285,13 @@ async fn handle_conn(
                     }
                     send_success(&mut stream).await;
                 }
+                Command::Sync(SyncCommand::Confirm) => match confirm_sync(&agent, bookie).await {
+                    Ok(result) => {
+                        send(&mut stream, Response::Json(result)).await;
+                        send_success(&mut stream).await;
+                    }
+                    Err(err) => send_error(&mut stream, err).await,
+                },
                 Command::Sync(SyncCommand::ReconcileGaps) => {
                     // First acquire all actor_ids via a read only sqlite connection
                     let ro_conn = match agent.pool().read().await {
