@@ -118,6 +118,7 @@ pub enum Command {
 pub enum SyncCommand {
     Generate,
     Confirm,
+    ConfirmAll,
     ReconcileGaps,
     CheckBookieConsistency,
 }
@@ -198,7 +199,7 @@ type FramedStream = Framed<
 
 /// Confirm receipt AND application of frontiers actually advertised by peers.
 /// This is a local observation barrier, not a global snapshot or consensus.
-async fn confirm_sync(agent: &Agent, bookie: &Bookie) -> eyre::Result<serde_json::Value> {
+async fn confirm_sync(agent: &Agent, bookie: &Bookie, all_members: bool) -> eyre::Result<serde_json::Value> {
     let config = agent.config();
     if !config.gossip.interest.is_empty() && !config.gossip.interest.iter().any(|v| v == "*") {
         eyre::bail!("sync confirm requires a full-replica interest configuration");
@@ -206,27 +207,46 @@ async fn confirm_sync(agent: &Agent, bookie: &Bookie) -> eyre::Result<serde_json
     let needs_peer = !config.gossip.bootstrap.is_empty();
     drop(config);
     let started = Instant::now();
+    // Retain advertised data requirements even if their advertising peer leaves.
+    // Any replica may supply them; membership is not a data receipt.
+    let mut frontiers = HashMap::new();
     loop {
         let mut expected = HashMap::new();
-        {
-            let members = agent.members().read();
-            for (id, state) in &members.states {
-                if *id != agent.actor_id()
-                    && state.cluster_id == agent.cluster_id()
-                    && state.member_id == agent.member_id()
-                {
-                    expected.insert(*id, state.addr);
-                }
+        let (tx, mut rx) = mpsc::channel(1024);
+        agent.tx_foca().send(FocaInput::Cmd(FocaCmd::MembershipStates(tx))).await?;
+        while let Some(member) = rx.recv().await {
+            let actor = member.id();
+            if member.state() != foca::State::Down
+                && actor.id() != agent.actor_id()
+                && actor.cluster_id() == agent.cluster_id()
+                && actor.member_id() == agent.member_id()
+            {
+                expected.insert(actor.id(), actor.addr());
             }
         }
         let local = generate_sync(bookie, agent.actor_id()).await;
         let peers_applied = {
             let observations = agent.sync_observations().read();
-            expected.iter().all(|(id, addr)| {
+            for (id, observation) in observations.iter() {
+                if observation.observed_at >= started {
+                    frontiers.entry(*id).or_insert_with(|| observation.state.clone());
+                }
+            }
+            // A fresh reachable witness establishes the available frontier.
+            // Do not require a handshake with every gossip member: a crashed
+            // member can remain Alive until failure detection catches up.
+            // All frontiers actually observed in this barrier remain required.
+            let fresh = |(id, addr): (&ActorId, &std::net::SocketAddr)| {
                 observations.get(id).is_some_and(|observation| {
-                    observation.addr == *addr && observation.applied_since(&local, started)
+                    observation.addr == *addr && observation.observed_at >= started
                 })
-            })
+            };
+            let observed = if all_members {
+                expected.iter().all(fresh)
+            } else {
+                expected.is_empty() || expected.iter().any(fresh)
+            };
+            observed && frontiers.values().all(|state| local.compute_available_needs(state).is_empty())
         };
         if (!needs_peer || !expected.is_empty())
             && peers_applied
@@ -234,7 +254,7 @@ async fn confirm_sync(agent: &Agent, bookie: &Bookie) -> eyre::Result<serde_json
             && local.partial_need.is_empty()
         {
             return Ok(
-                json!({"confirmed": true, "peer_count": expected.len(), "scope": "observed_peer_frontiers"}),
+                json!({"confirmed": true, "peer_count": expected.len(), "observed_peer_count": frontiers.len(), "all_members": all_members, "scope": "observed_peer_frontiers"}),
             );
         }
         if started.elapsed() > Duration::from_secs(60) {
@@ -285,7 +305,7 @@ async fn handle_conn(
                     }
                     send_success(&mut stream).await;
                 }
-                Command::Sync(SyncCommand::Confirm) => match confirm_sync(&agent, bookie).await {
+                Command::Sync(command @ (SyncCommand::Confirm | SyncCommand::ConfirmAll)) => match confirm_sync(&agent, bookie, matches!(command, SyncCommand::ConfirmAll)).await {
                     Ok(result) => {
                         send(&mut stream, Response::Json(result)).await;
                         send_success(&mut stream).await;

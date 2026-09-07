@@ -497,6 +497,12 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             ))
             .await?;
         }
+        Command::Sync(SyncCommand::ConfirmAll) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Sync(
+                corro_admin::SyncCommand::ConfirmAll,
+            )).await?;
+        }
         Command::Sync(SyncCommand::ReconcileGaps) => {
             let mut conn = AdminConn::connect(cli.admin_path()).await?;
             conn.send_command(corro_admin::Command::Sync(
@@ -794,6 +800,8 @@ enum SyncCommand {
     Generate,
     /// Confirm local application of fresh native peer frontiers (full replicas only).
     Confirm,
+    /// Observe all current members before an explicit initialization decision; not a consensus barrier.
+    ConfirmAll,
     /// Check in-memory bookie state against DB-loaded bookie state
     CheckBookieConsistency,
     ReconcileGaps,

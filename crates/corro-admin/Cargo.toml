@@ -12,6 +12,7 @@ corro-types = { path = "../corro-types" }
 corro-agent = { path = "../corro-agent" }
 eyre = { workspace = true }
 futures = { workspace = true }
+foca = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

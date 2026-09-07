@@ -872,6 +872,7 @@ dependencies = [
  "corro-agent",
  "corro-types",
  "eyre",
+ "foca",
  "futures",
  "rangemap",
  "rusqlite",
